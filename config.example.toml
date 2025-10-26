@@ -68,6 +68,17 @@ value = "v=spf1 include:_spf.google.com ~all"
 ttl = 3600
 # No interval = set once at startup
 
+# Dynamic SPF record with current server IP
+# Uses {ipv4} placeholder that gets replaced with resolved IPv4
+[[provider.records]]
+domain = "example.com"
+hostname = "@"
+type = "text"
+record_type = "TXT"
+value = "v=spf1 mx ip4:{ipv4} -all"
+ttl = 300
+interval_seconds = 120  # Updates when IP changes
+
 # Static MX record for mail
 [[provider.records]]
 domain = "example.com"

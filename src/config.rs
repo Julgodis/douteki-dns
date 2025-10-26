@@ -249,6 +249,14 @@ impl RecordData {
         )
     }
 
+    /// Check if this record type needs dynamic IP substitution in its value
+    pub fn needs_ip_substitution(&self) -> bool {
+        match self {
+            RecordData::Text { value, .. } => value.contains("{ipv4}") || value.contains("{ipv6}"),
+            _ => false,
+        }
+    }
+
     /// Generate the reverse DNS domain for an IP address
     pub fn reverse_dns_domain(ip: IpAddr) -> String {
         match ip {

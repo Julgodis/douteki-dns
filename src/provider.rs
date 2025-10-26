@@ -213,7 +213,35 @@ impl GlesysProvider {
                     };
                     (value.clone(), Some((IpAddr::V6(ip), value.clone())))
                 }
-                RecordData::Text { value, .. } => (value.clone(), None),
+                RecordData::Text { value, .. } => {
+                    // Check if the text value needs IP substitution
+                    let mut substituted = value.clone();
+                    if value.contains("{ipv4}") {
+                        if let Some(ip) = ips.ipv4 {
+                            substituted = substituted.replace("{ipv4}", &ip.to_string());
+                        } else {
+                            warn!(
+                                record_id = record.record_id.as_deref(),
+                                fqdn = %record.fqdn(),
+                                "Text record contains {{ipv4}} but no IPv4 resolved; skipping"
+                            );
+                            continue;
+                        }
+                    }
+                    if value.contains("{ipv6}") {
+                        if let Some(ip) = ips.ipv6 {
+                            substituted = substituted.replace("{ipv6}", &ip.to_string());
+                        } else {
+                            warn!(
+                                record_id = record.record_id.as_deref(),
+                                fqdn = %record.fqdn(),
+                                "Text record contains {{ipv6}} but no IPv6 resolved; skipping"
+                            );
+                            continue;
+                        }
+                    }
+                    (substituted, None)
+                }
                 RecordData::Static { address, .. } => (address.to_string(), None),
             };
 
