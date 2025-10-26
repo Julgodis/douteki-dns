@@ -532,16 +532,27 @@ impl GlesysProvider {
                 ptr_record.domain = ptr_domain.clone();
                 ptr_record.hostname = ptr_host.clone();
 
-                self.update_record(client, record_id, &ptr_record, hostname)?;
-                existing_ids.insert(ptr_key, record_id.clone());
+                match self.update_record(client, record_id, &ptr_record, hostname) {
+                    Ok(_) => {
+                        existing_ids.insert(ptr_key, record_id.clone());
 
-                results.push(RecordUpdate {
-                    fqdn: reverse_domain,
-                    record_type: "PTR".to_string(),
-                    data: hostname.to_string(),
-                    outcome: UpdateOutcome::Updated,
-                    record_id: Some(record_id.clone()),
-                });
+                        results.push(RecordUpdate {
+                            fqdn: reverse_domain,
+                            record_type: "PTR".to_string(),
+                            data: hostname.to_string(),
+                            outcome: UpdateOutcome::Updated,
+                            record_id: Some(record_id.clone()),
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            reverse_domain = %reverse_domain,
+                            ip = %ip,
+                            error = %err,
+                            "Failed to update PTR record"
+                        );
+                    }
+                }
             }
             None => {
                 debug!(
@@ -556,16 +567,27 @@ impl GlesysProvider {
                 ptr_record.domain = ptr_domain.clone();
                 ptr_record.hostname = ptr_host.clone();
 
-                let created_id = self.create_record(client, &ptr_record, hostname)?;
-                existing_ids.insert(ptr_key, created_id.clone());
+                match self.create_record(client, &ptr_record, hostname) {
+                    Ok(created_id) => {
+                        existing_ids.insert(ptr_key, created_id.clone());
 
-                results.push(RecordUpdate {
-                    fqdn: reverse_domain,
-                    record_type: "PTR".to_string(),
-                    data: hostname.to_string(),
-                    outcome: UpdateOutcome::Created,
-                    record_id: Some(created_id),
-                });
+                        results.push(RecordUpdate {
+                            fqdn: reverse_domain,
+                            record_type: "PTR".to_string(),
+                            data: hostname.to_string(),
+                            outcome: UpdateOutcome::Created,
+                            record_id: Some(created_id),
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            reverse_domain = %reverse_domain,
+                            ip = %ip,
+                            error = %err,
+                            "Failed to create PTR record - reverse DNS zone may not be delegated to this account"
+                        );
+                    }
+                }
             }
         }
 
@@ -573,8 +595,16 @@ impl GlesysProvider {
     }
 
     fn unique_domains(&self) -> BTreeSet<&str> {
+        use crate::config::RecordData;
         self.records
             .iter()
+            .filter(|record| {
+                // Skip PTR records as their domains are computed dynamically from IPs
+                !matches!(
+                    record.data,
+                    RecordData::DynamicPtrV4 { .. } | RecordData::DynamicPtrV6 { .. }
+                )
+            })
             .map(|record| record.domain.as_str())
             .collect()
     }
