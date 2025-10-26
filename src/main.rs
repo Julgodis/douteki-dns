@@ -122,7 +122,7 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
                         info!(
                             fqdn = update.fqdn,
                             record_type = %update.record_type,
-                            ip = %update.ip,
+                            data = %update.data,
                             outcome = update.outcome.as_str(),
                             record_id = update.record_id.as_deref(),
                             "DNS record change applied"

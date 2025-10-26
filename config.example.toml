@@ -1,7 +1,7 @@
 # Example configuration for douteki-dns
 # Copy to config.toml and fill in the secrets before running.
 user_agent = "douteki-dns/0.1"
-# check_interval_seconds = 120 # optional override; must be less than record TTLs
+# check_interval_seconds = 120 # optional global interval; per-record intervals take precedence
 
 [ip_sources.ipv4]
 type = "http"
@@ -18,17 +18,70 @@ api_key = "superSecret"
 update_endpoint = "https://api.glesys.com/domain/updaterecord"
 add_endpoint = "https://api.glesys.com/domain/addrecord"
 list_endpoint = "https://api.glesys.com/domain/listrecords"
+delete_endpoint = "https://api.glesys.com/domain/deleterecord"
 
+# Dynamic IPv4 record (A) - updates with resolved IPv4 address
 [[provider.records]]
-# record_id is optional; omit it to create the record when missing
-record_id = "abcdef123456"
 domain = "example.com"
 hostname = "home"
+type = "dynamic-ipv4"
+ttl = 300
+interval_seconds = 120  # Check every 2 minutes
+
+# Dynamic IPv6 record (AAAA) - updates with resolved IPv6 address
+[[provider.records]]
+domain = "example.com"
+hostname = "home"
+type = "dynamic-ipv6"
+ttl = 300
+interval_seconds = 120
+
+# Dynamic PTR record for IPv4 reverse DNS
+# Automatically creates/updates PTR in correct reverse zone (e.g., X.Y.Z.W.in-addr.arpa)
+# Deletes old PTR records when IP changes
+[[provider.records]]
+domain = "ignored-for-ptr"  # Domain is computed from IP
+hostname = "ptr-v4"         # Used for tracking only
+type = "dynamic-ptr-v4"
+value = "home.example.com"  # The hostname to point to
+ttl = 300
+interval_seconds = 120
+
+# Dynamic PTR record for IPv6 reverse DNS
+# Automatically creates/updates PTR in correct reverse zone (e.g., *.ip6.arpa)
+# Deletes old PTR records when IP changes
+[[provider.records]]
+domain = "ignored-for-ptr"  # Domain is computed from IP
+hostname = "ptr-v6"         # Used for tracking only
+type = "dynamic-ptr-v6"
+value = "home.example.com"  # The hostname to point to
+ttl = 300
+interval_seconds = 120
+
+# Static text record (TXT) - for SPF, DKIM, etc.
+[[provider.records]]
+domain = "example.com"
+hostname = "@"
+type = "text"
+record_type = "TXT"
+value = "v=spf1 include:_spf.google.com ~all"
+ttl = 3600
+# No interval = set once at startup
+
+# Static MX record for mail
+[[provider.records]]
+domain = "example.com"
+hostname = "@"
+type = "text"
+record_type = "MX"
+value = "10 mail.example.com"
+ttl = 3600
+
+# Static A record (not dynamic)
+[[provider.records]]
+domain = "example.com"
+hostname = "static"
+type = "static"
 record_type = "A"
-ttl = 300
-
-[[provider.records]]
-domain = "example.com"
-hostname = "home"
-record_type = "AAAA"
-ttl = 300
+address = "192.0.2.1"
+ttl = 3600
