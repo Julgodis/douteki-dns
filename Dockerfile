@@ -1,6 +1,4 @@
-# syntax=docker/dockerfile:1.6
-# syntax=docker/dockerfile:1.7
-FROM rust:1.83-slim AS builder
+FROM rust:slim AS builder
 WORKDIR /src
 
 RUN apt-get update \
@@ -9,21 +7,25 @@ RUN apt-get update \
 
 # Cache dependencies separately and warm registry using cache mounts.
 COPY Cargo.toml Cargo.lock ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    cargo fetch --locked
-
 COPY src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    cargo fetch --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    --mount=type=cache,target=/src/target,id=douteki-target \
     cargo build --release --locked
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    --mount=type=cache,target=/src/target,id=douteki-target \
     cargo test --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
+    --mount=type=cache,target=/src/target,id=douteki-target \
+    cp ./target/release/douteki-dns /usr/local/bin/douteki-dns
 
 FROM debian:bookworm-slim
+ENV GITHUB_REPOSITORY=Julgodis/douteki-dns
 LABEL org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}"
 
 RUN apt-get update \
@@ -31,7 +33,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /src/target/release/douteki-dns /usr/local/bin/douteki-dns
+COPY --from=builder /usr/local/bin/douteki-dns /usr/local/bin/douteki-dns
 
 ENV RUST_LOG=info
 ENTRYPOINT ["/usr/local/bin/douteki-dns"]

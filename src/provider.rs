@@ -235,9 +235,8 @@ impl GlesysProvider {
     ) -> Result<()> {
         let payload = json!({
             "recordid": record_id,
-            "domainname": record.domain,
             "host": record.hostname,
-            "recordtype": record.record_type.as_api_value(),
+            "type": record.record_type.as_api_value(),
             "ttl": record.ttl,
             "data": ip.to_string(),
         });
@@ -292,7 +291,7 @@ impl GlesysProvider {
         let payload = json!({
             "domainname": record.domain,
             "host": record.hostname,
-            "recordtype": record.record_type.as_api_value(),
+            "type": record.record_type.as_api_value(),
             "ttl": record.ttl,
             "data": ip.to_string(),
         });
