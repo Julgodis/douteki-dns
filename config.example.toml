@@ -20,13 +20,26 @@ add_endpoint = "https://api.glesys.com/domain/addrecord"
 list_endpoint = "https://api.glesys.com/domain/listrecords"
 delete_endpoint = "https://api.glesys.com/domain/deleterecord"
 
-# Dynamic IPv4 record (A) - updates with resolved IPv4 address
+# Dynamic IPv4 records (A) - both names use the same resolved IPv4 address
 [[provider.records]]
 domain = "example.com"
-hostname = "home"
+hostnames = ["home", "vpn"]
 type = "dynamic-ipv4"
 ttl = 300
 interval_seconds = 120  # Check every 2 minutes
+
+# A wildcard A record for names without an explicit DNS record:
+# [[provider.records]]
+# domain = "example.com"
+# hostname = "*"
+# type = "dynamic-ipv4"
+# ttl = 300
+
+# The same hostname in several separate GleSYS DNS zones:
+# [[provider.records]]
+# domains = ["example.com", "example.net"]
+# hostname = "home"
+# type = "dynamic-ipv4"
 
 # Dynamic IPv6 record (AAAA) - updates with resolved IPv6 address
 [[provider.records]]

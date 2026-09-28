@@ -14,14 +14,7 @@ use tracing_subscriber::EnvFilter;
 fn main() -> Result<()> {
     init_tracing()?;
     let cli = Cli::parse();
-    let config_path = cli.config.clone();
-
-    let config = config::load_config(&config_path).with_context(|| {
-        format!(
-            "failed to load configuration from {}",
-            config_path.display()
-        )
-    })?;
+    let config = config::load_config(&cli.config).context("failed to load configuration")?;
 
     let client = build_client(&config)?;
 
@@ -39,9 +32,9 @@ fn main() -> Result<()> {
     propagate_version = true
 )]
 struct Cli {
-    /// Path to the configuration TOML file
+    /// Configuration TOML file; repeat to overlay files in order
     #[arg(short, long, value_name = "FILE", default_value = "config.toml")]
-    config: PathBuf,
+    config: Vec<PathBuf>,
     /// Command to execute. Defaults to `ddns`.
     #[command(subcommand)]
     command: Option<Command>,
@@ -214,4 +207,30 @@ fn init_tracing() -> Result<()> {
         .try_init()
         .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_flags_preserve_input_order_and_default_only_when_absent() {
+        let cli = Cli::try_parse_from([
+            "douteki-dns",
+            "--config",
+            "base.toml",
+            "--config",
+            "local.toml",
+            "ddns",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.config,
+            [PathBuf::from("base.toml"), PathBuf::from("local.toml")]
+        );
+        assert_eq!(
+            Cli::try_parse_from(["douteki-dns"]).unwrap().config,
+            [PathBuf::from("config.toml")]
+        );
+    }
 }
