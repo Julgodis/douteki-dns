@@ -4,15 +4,43 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
+use serde::de::{self, Deserializer};
 use std::net::IpAddr;
 
-pub fn load_config(path: &Path) -> Result<Config> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read configuration file: {}", path.display()))?;
-    let config: Config = toml::from_str(&raw)
-        .with_context(|| format!("failed to parse configuration TOML: {}", path.display()))?;
+pub fn load_config(paths: &[impl AsRef<Path>]) -> Result<Config> {
+    ensure!(
+        !paths.is_empty(),
+        "at least one configuration file is required"
+    );
+    let mut merged = toml::Value::Table(toml::map::Map::new());
+    for path in paths {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration file: {}", path.display()))?;
+        let value: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse configuration TOML: {}", path.display()))?;
+        merge_value(&mut merged, value);
+    }
+    let config: Config = merged
+        .try_into()
+        .context("failed to decode merged configuration")?;
     config.validate()?;
     Ok(config)
+}
+
+fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                if let Some(existing) = base.get_mut(&key) {
+                    merge_value(existing, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,7 +155,7 @@ pub struct GlesysProvider {
     pub list_endpoint: String,
     #[serde(default = "default_glesys_delete_endpoint")]
     pub delete_endpoint: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_records")]
     pub records: Vec<GlesysRecord>,
 }
 
@@ -143,6 +171,11 @@ impl GlesysProvider {
                 !record.domain.is_empty(),
                 "Record '{}' must specify a domain",
                 record.hostname
+            );
+            ensure!(
+                !record.hostname.is_empty(),
+                "Record in domain '{}' must specify a hostname",
+                record.domain
             );
 
             if record.data.requires_ipv4() {
@@ -185,6 +218,64 @@ pub struct GlesysRecord {
     /// Static records without an interval are set once at startup.
     #[serde(default)]
     pub interval_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GlesysRecordInput {
+    #[serde(default)]
+    record_id: Option<String>,
+    domain: Option<String>,
+    domains: Option<Vec<String>>,
+    hostname: Option<String>,
+    hostnames: Option<Vec<String>>,
+    #[serde(flatten)]
+    data: RecordData,
+    #[serde(default = "default_glesys_ttl")]
+    ttl: u32,
+    #[serde(default)]
+    interval_seconds: Option<u64>,
+}
+
+fn deserialize_records<'de, D>(deserializer: D) -> Result<Vec<GlesysRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let inputs = Vec::<GlesysRecordInput>::deserialize(deserializer)?;
+    let mut records = Vec::new();
+    for input in inputs {
+        let domains = match (input.domain, input.domains) {
+            (Some(domain), None) => vec![domain],
+            (None, Some(domains)) if !domains.is_empty() => domains,
+            (None, Some(_)) => return Err(de::Error::custom("domains must not be empty")),
+            (None, None) => return Err(de::Error::custom("record requires domain or domains")),
+            _ => return Err(de::Error::custom("use either domain or domains")),
+        };
+        let hostnames = match (input.hostname, input.hostnames) {
+            (Some(hostname), None) => vec![hostname],
+            (None, Some(hostnames)) if !hostnames.is_empty() => hostnames,
+            (None, Some(_)) => return Err(de::Error::custom("hostnames must not be empty")),
+            (None, None) => return Err(de::Error::custom("record requires hostname or hostnames")),
+            _ => return Err(de::Error::custom("use either hostname or hostnames")),
+        };
+        if input.record_id.is_some() && (domains.len() > 1 || hostnames.len() > 1) {
+            return Err(de::Error::custom(
+                "record_id cannot be shared by multiple domains or hostnames",
+            ));
+        }
+        for domain in domains {
+            for hostname in &hostnames {
+                records.push(GlesysRecord {
+                    record_id: input.record_id.clone(),
+                    domain: domain.clone(),
+                    hostname: hostname.clone(),
+                    data: input.data.clone(),
+                    ttl: input.ttl,
+                    interval_seconds: input.interval_seconds,
+                });
+            }
+        }
+    }
+    Ok(records)
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -326,4 +417,107 @@ fn default_glesys_list_endpoint() -> String {
 
 fn default_glesys_delete_endpoint() -> String {
     "https://api.glesys.com/domain/deleterecord".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn later_files_override_scalars_and_arrays_but_keep_other_table_keys() {
+        let directory = std::env::temp_dir().join(format!(
+            "douteki-dns-config-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.toml");
+        let second = directory.join("second.toml");
+        fs::write(
+            &first,
+            r#"
+user_agent = "first"
+[ip_sources.ipv4]
+type = "static"
+address = "192.0.2.1"
+[provider]
+type = "glesys"
+api_user = "user"
+api_key = "old-key"
+[[provider.records]]
+domain = "old.example"
+hostname = "old"
+type = "dynamic-ipv4"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &second,
+            r#"
+user_agent = "second"
+[provider]
+api_key = "new-key"
+[[provider.records]]
+domain = "example.com"
+hostnames = ["a", "b", "*"]
+type = "dynamic-ipv4"
+ttl = 120
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&[&first, &second]).unwrap();
+        assert_eq!(config.user_agent(), "second");
+        assert!(matches!(
+            config.ip_sources.ipv4,
+            Some(IpSource::Static { .. })
+        ));
+        let DnsProvider::Glesys(provider) = config.provider;
+        assert_eq!(provider.api_user, "user");
+        assert_eq!(provider.api_key, "new-key");
+        assert_eq!(provider.records.len(), 3);
+        assert_eq!(provider.records[0].hostname, "a");
+        assert_eq!(provider.records[1].hostname, "b");
+        assert_eq!(provider.records[2].hostname, "*");
+        assert!(provider.records.iter().all(|record| record.ttl == 120));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plural_domains_expand_and_shared_record_id_is_rejected() {
+        let raw = r#"
+[provider]
+type = "glesys"
+api_user = "user"
+api_key = "key"
+[[provider.records]]
+domains = ["example.com", "example.net"]
+hostnames = ["a", "b"]
+type = "dynamic-ipv4"
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        let DnsProvider::Glesys(provider) = config.provider;
+        let names: Vec<_> = provider
+            .records
+            .iter()
+            .map(|r| (r.domain.as_str(), r.hostname.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("example.com", "a"),
+                ("example.com", "b"),
+                ("example.net", "a"),
+                ("example.net", "b")
+            ]
+        );
+        assert!(
+            toml::from_str::<Config>(&raw.replace(
+                "type = \"dynamic-ipv4\"",
+                "type = \"dynamic-ipv4\"\nrecord_id = \"123\""
+            ))
+            .is_err()
+        );
+    }
 }

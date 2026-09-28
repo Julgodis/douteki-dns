@@ -11,6 +11,7 @@
 - Manage dynamic A, AAAA, and PTR records, along with static address and text records such as TXT and MX.
 - Create configured records that are missing from the provider and update records when their values change.
 - Poll address sources at a configurable interval (derived from the minimum record TTL by default) and follow activity through structured logs.
+- Load multiple configuration files in order and share record settings across DNS names.
 
 ## Configure and run
 
@@ -38,6 +39,26 @@ docker run --rm \
 ```
 
 The updater checks for address changes continuously. It applies the configured record values at startup and again when a resolved IP address changes. Set `check_interval_seconds` to control polling; by default, the interval is derived from the lowest configured record TTL.
+
+## Configuration files and shared record settings
+
+Pass `--config` more than once to apply files from left to right. Later files override earlier values; tables merge by key, while arrays (including `provider.records`) replace the earlier array. If no file is specified, the default is `config.toml`.
+
+```sh
+cargo run -- --config config.toml --config local.toml ddns
+```
+
+For names in the same DNS zone, use `hostnames` to share one record's type, TTL, and value:
+
+```toml
+[[provider.records]]
+domain = "example.com"
+hostnames = ["a", "b"] # a.example.com and b.example.com
+type = "dynamic-ipv4"
+ttl = 300
+```
+
+Use `domains = ["example.com", "example.net"]` with `hostname = "home"` for the same host in several GleSYS zones. Both plural fields can be combined. Use `hostname = "*"` for a DNS wildcard such as `*.example.com`; the app sends `*` as the GleSYS host, so GleSYS must accept that record. A wildcard covers names without an explicit record; it does not replace the zone apex (`@`). Each expanded record is managed separately, so `record_id` can only be set when the entry expands to one record.
 
 ## Commands and logging
 
