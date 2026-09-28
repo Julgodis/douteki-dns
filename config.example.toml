@@ -14,7 +14,7 @@ url = "https://api64.ipify.org"
 [provider]
 type = "glesys"
 api_user = "cl12345"
-api_key = "superSecret"
+api_key = "REPLACE_WITH_GLESYS_API_KEY"
 update_endpoint = "https://api.glesys.com/domain/updaterecord"
 add_endpoint = "https://api.glesys.com/domain/addrecord"
 list_endpoint = "https://api.glesys.com/domain/listrecords"
