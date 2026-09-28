@@ -1,5 +1,9 @@
 # douteki-dns
 
+<p align="center">
+  <img src="assets/logo.png" alt="douteki-dns logo" width="180">
+</p>
+
 `douteki-dns` is a small Rust service that keeps DNS records in sync with a host's current IPv4 and IPv6 addresses. It currently supports the [GleSYS DNS API](https://glesys.com/).
 
 > [!WARNING]
@@ -75,23 +79,6 @@ RUST_LOG=debug cargo run -- --config config.toml ddns
 ```
 
 For Docker, pass the same setting with `-e RUST_LOG=debug`.
-
-## Container image releases
-
-Build a local image with Docker:
-
-```sh
-docker build -t douteki-dns:local .
-```
-
-GitHub Actions runs formatting, compilation, and Rust tests on pushes to `master`, pull requests targeting `master`, and version tags. To publish a versioned image, push a version tag matching the package version in `Cargo.toml`:
-
-```sh
-git tag v0.1.2
-git push origin v0.1.2
-```
-
-After the checks pass, the workflow publishes `ghcr.io/julgodis/douteki-dns:0.1.2`. GitHub Container Registry package visibility is managed separately from repository visibility; set the package to Public if you want anonymous pulls.
 
 ## Contributing
 
