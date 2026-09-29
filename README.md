@@ -37,6 +37,7 @@ Or run the container image, mounting the configuration read-only:
 
 ```sh
 docker run --rm \
+  -v douteki-dns-state:/app \
   -v "$PWD/config.toml:/app/config.toml:ro" \
   ghcr.io/julgodis/douteki-dns:<version> \
   --config /app/config.toml ddns
@@ -91,3 +92,5 @@ cargo test --locked
 ```
 
 Records with the same name and DNS type are matched by their current value. If several records could match a changed value, set `record_id` explicitly; the updater refuses ambiguous updates. Explicit IDs must belong to the configured name, zone, and type.
+
+Dynamic PTR records discover the longest matching reverse zone through GleSYS `domain/list`. The API key needs permission to list zones and records. The configured PTR `domain` and `hostname` identify the managed entry; keep them stable. Ownership is journaled in `provider.ptr_state_file` (default `ptr-state.json`). Keep this file on persistent writable storage, including in containers, and use a separate file per updater. The updater creates the replacement before deleting its previous PTR and checks that the previous record has not changed externally. A lost journal prevents cleanup of older addresses; it does not authorize deletion of unrelated PTRs.

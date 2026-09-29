@@ -138,8 +138,16 @@ impl GlesysProvider {
         &self,
         client: &reqwest::blocking::Client,
     ) -> Result<Vec<GlesysListedRecord>> {
+        self.list_domains_records(client, self.unique_domains())
+    }
+
+    fn list_domains_records<'a>(
+        &self,
+        client: &reqwest::blocking::Client,
+        domains: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<GlesysListedRecord>> {
         let mut aggregated = Vec::new();
-        for domain in self.unique_domains() {
+        for domain in domains {
             let payload = json!({ "domainname": domain });
 
             debug!(
@@ -199,7 +207,7 @@ impl GlesysProvider {
         ips: &ResolvedIps,
     ) -> Result<Vec<RecordUpdate>> {
         let mut results = Vec::with_capacity(self.records.len());
-        let mut existing_ids = self.fetch_existing_record_ids(client)?;
+        let existing_ids = self.fetch_existing_record_ids(client)?;
         let mut claimed: HashSet<String> = self
             .records
             .iter()
@@ -289,14 +297,7 @@ impl GlesysProvider {
 
             // For PTR records, we need to handle them differently
             if let Some((ip, hostname)) = ptr_info {
-                self.handle_ptr_record(
-                    client,
-                    record,
-                    ip,
-                    &hostname,
-                    &mut existing_ids,
-                    &mut results,
-                )?;
+                self.handle_ptr_record(client, record, ip, &hostname, &mut results)?;
                 continue;
             }
 
@@ -523,141 +524,137 @@ impl GlesysProvider {
         Ok(())
     }
 
+    pub fn list_domains(&self, client: &reqwest::blocking::Client) -> Result<Vec<String>> {
+        let response = client
+            .get(&self.domains_endpoint)
+            .basic_auth(&self.api_user, Some(&self.api_key))
+            .send()
+            .context("failed to list GleSYS zones")?;
+        let status = response.status();
+        let body = response.text()?;
+        ensure!(
+            status.is_success(),
+            "GleSYS list zones error ({status}): {body}"
+        );
+        let parsed: GlesysDomainsResponse =
+            serde_json::from_str(&body).context("invalid GleSYS zone list")?;
+        Ok(parsed
+            .response
+            .domains
+            .into_iter()
+            .map(|d| d.domainname.trim_end_matches('.').to_ascii_lowercase())
+            .collect())
+    }
+
     fn handle_ptr_record(
         &self,
         client: &reqwest::blocking::Client,
         record: &GlesysRecord,
         ip: IpAddr,
         hostname: &str,
-        existing_ids: &mut HashMap<RecordKey, Vec<GlesysListedRecord>>,
         results: &mut Vec<RecordUpdate>,
     ) -> Result<()> {
-        use crate::config::RecordData;
-
-        // Generate the reverse DNS domain from the IP
-        let reverse_domain = RecordData::reverse_dns_domain(ip);
-
-        // Extract the hostname part (first label) and domain part
-        let (ptr_host, ptr_domain) = if let Some(pos) = reverse_domain.find('.') {
-            let (h, d) = reverse_domain.split_at(pos);
-            (h.to_string(), d[1..].to_string()) // Skip the leading '.'
-        } else {
-            (reverse_domain.clone(), String::new())
-        };
-
-        // Create a modified record for PTR with the computed domain
-        let ptr_key = RecordKey {
-            domain: ptr_domain.clone(),
-            host: ptr_host.clone(),
-            record_type: "PTR".to_string(),
-        };
-
-        // Check if we already have a PTR record for this IP
-        let existing_id = select_record(
-            record,
-            hostname,
-            existing_ids
-                .get(&ptr_key)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            &HashSet::new(),
-            false,
-        )?;
-
-        // Also check if we have PTR records for the original hostname/domain
-        // (from before the IP changed) and delete them
-        let original_key = RecordKey::from_config(record);
-        if let Some(old_record) = existing_ids
-            .get(&original_key)
-            .and_then(|records| records.first())
-        {
-            let old_id = &old_record.record_id;
-            if original_key != ptr_key {
-                debug!(
-                    record_id = %old_id,
-                    old_domain = %original_key.domain,
-                    old_host = %original_key.host,
-                    new_domain = %ptr_domain,
-                    new_host = %ptr_host,
-                    "Deleting old PTR record after IP change"
-                );
-                self.delete_record(client, old_id)?;
-                existing_ids.remove(&original_key);
-            }
+        use crate::state::{OwnedPtr, PtrJournal};
+        let reverse = crate::config::RecordData::reverse_dns_domain(ip);
+        let domains = self.list_domains(client)?;
+        let (host, domain) = reverse_location(&reverse, &domains)?;
+        let mut desired = record.clone();
+        desired.hostname = host.clone();
+        desired.domain = domain.clone();
+        let identity = serde_json::to_string(&(
+            &self.api_user,
+            &self.list_endpoint,
+            RecordKey::from_config(record).domain,
+            &record.hostname,
+            record.data.dns_record_type(),
+            record.data.requires_ipv4(),
+        ))?;
+        let mut journal = PtrJournal::open(&self.ptr_state_file)?;
+        let previous = journal.records.get(&identity).cloned().unwrap_or_default();
+        let listed = self.list_domains_records(client, [domain.as_str()])?;
+        let key = RecordKey::from_config(&desired);
+        let candidates: Vec<_> = listed
+            .into_iter()
+            .filter(|r| RecordKey::from_listed(r) == key)
+            .collect();
+        // An explicit ID bootstraps ownership. Later migrations must use the new reverse name.
+        if !previous.is_empty() {
+            desired.record_id = None;
         }
-
-        match existing_id {
-            Some(ref record_id) => {
-                debug!(
-                    record_id = %record_id,
-                    reverse_domain = %reverse_domain,
-                    hostname = %hostname,
-                    ip = %ip,
-                    "Updating PTR record"
-                );
-
-                // Create a temporary record with the PTR domain info
-                let mut ptr_record = record.clone();
-                ptr_record.domain = ptr_domain.clone();
-                ptr_record.hostname = ptr_host.clone();
-
-                match self.update_record(client, record_id, &ptr_record, hostname) {
-                    Ok(_) => {
-                        results.push(RecordUpdate {
-                            fqdn: reverse_domain,
-                            record_type: "PTR".to_string(),
-                            data: hostname.to_string(),
-                            outcome: UpdateOutcome::Updated,
-                            record_id: Some(record_id.clone()),
-                        });
-                    }
-                    Err(err) => {
-                        warn!(
-                            reverse_domain = %reverse_domain,
-                            ip = %ip,
-                            error = %err,
-                            "Failed to update PTR record"
-                        );
-                        return Err(err);
-                    }
-                }
+        if let Some(owned) = previous
+            .iter()
+            .find(|r| r.domain == domain && r.host == host)
+            && let Some(id) = &owned.id
+            && candidates.iter().any(|r| &r.record_id == id)
+        {
+            desired.record_id = Some(id.clone());
+        }
+        let id = select_record(&desired, hostname, &candidates, &HashSet::new(), false)?;
+        // Save intent before creating: a restart can rediscover an interrupted successful add.
+        let mut owned = OwnedPtr {
+            domain,
+            host,
+            data: hostname.into(),
+            id: id.clone(),
+        };
+        let mut pending = previous.clone();
+        pending.retain(|r| !(r.domain == owned.domain && r.host == owned.host));
+        pending.push(owned.clone());
+        journal.records.insert(identity.clone(), pending);
+        journal.save()?;
+        let update = match id {
+            Some(id) => {
+                self.update_record(client, &id, &desired, hostname)?;
+                RecordUpdate::updated(&desired, hostname.into(), Some(id))
             }
             None => {
-                debug!(
-                    reverse_domain = %reverse_domain,
-                    hostname = %hostname,
-                    ip = %ip,
-                    "Creating PTR record"
-                );
-
-                // Create a temporary record with the PTR domain info
-                let mut ptr_record = record.clone();
-                ptr_record.domain = ptr_domain.clone();
-                ptr_record.hostname = ptr_host.clone();
-
-                match self.create_record(client, &ptr_record, hostname) {
-                    Ok(created_id) => {
-                        results.push(RecordUpdate {
-                            fqdn: reverse_domain,
-                            record_type: "PTR".to_string(),
-                            data: hostname.to_string(),
-                            outcome: UpdateOutcome::Created,
-                            record_id: Some(created_id),
-                        });
-                    }
-                    Err(err) => {
-                        warn!(
-                            reverse_domain = %reverse_domain,
-                            ip = %ip,
-                            error = %err,
-                            "Failed to create PTR record - reverse DNS zone may not be delegated to this account"
-                        );
-                        return Err(err);
-                    }
-                }
+                let id = self.create_record(client, &desired, hostname)?;
+                RecordUpdate::created(&desired, hostname.into(), Some(id))
             }
+        };
+        owned.id = update.record_id.clone();
+        let pending = journal.records.get_mut(&identity).unwrap();
+        *pending.last_mut().unwrap() = owned.clone();
+        journal.save()?;
+        results.push(update);
+        // Create the replacement first. Delete only records whose stored identity still matches.
+        for old in previous {
+            if old.domain == owned.domain && old.host == owned.host {
+                continue;
+            }
+            let records = self.list_domains_records(client, [old.domain.as_str()])?;
+            let matches: Vec<_> = records
+                .iter()
+                .filter(|r| {
+                    if let Some(id) = &old.id {
+                        &r.record_id == id
+                    } else {
+                        r.host == old.host && r.record_type == "PTR" && r.data == old.data
+                    }
+                })
+                .collect();
+            ensure!(
+                matches.len() <= 1,
+                "ambiguous interrupted PTR creation; refusing cleanup"
+            );
+            if let Some(existing) = matches.first() {
+                ensure!(
+                    existing.domain == old.domain
+                        && existing.host == old.host
+                        && existing.record_type == "PTR"
+                        && existing.data == old.data,
+                    "previous PTR was changed externally; refusing to delete {}",
+                    existing.record_id
+                );
+                self.delete_record(client, &existing.record_id)?;
+            }
+            journal
+                .records
+                .get_mut(&identity)
+                .unwrap()
+                .retain(|r| r != &old);
+            journal.save()?;
         }
-
         Ok(())
     }
 
@@ -675,6 +672,33 @@ impl GlesysProvider {
             .map(|record| record.domain.as_str())
             .collect()
     }
+}
+
+fn reverse_location(reverse: &str, domains: &[String]) -> Result<(String, String)> {
+    let domain = domains
+        .iter()
+        .filter(|domain| reverse == domain.as_str() || reverse.ends_with(&format!(".{domain}")))
+        .max_by_key(|domain| domain.len())
+        .with_context(|| format!("no delegated GleSYS reverse zone found for {reverse}"))?;
+    let host = if reverse == domain {
+        "@"
+    } else {
+        &reverse[..reverse.len() - domain.len() - 1]
+    };
+    Ok((host.into(), domain.clone()))
+}
+
+#[derive(Deserialize)]
+struct GlesysDomainsResponse {
+    response: GlesysDomainsBody,
+}
+#[derive(Deserialize)]
+struct GlesysDomainsBody {
+    domains: Vec<GlesysDomain>,
+}
+#[derive(Deserialize)]
+struct GlesysDomain {
+    domainname: String,
 }
 
 impl GlesysRecord {
@@ -809,23 +833,43 @@ value="one"
             None
         );
     }
-    #[test]
-    fn ptr_failure_is_returned_to_the_retry_loop() {
-        let api = crate::test_support::MockApi::new(vec![(503, json!({"error":"retry"}))]);
-        let provider: GlesysProvider = toml::from_str(&format!(
+
+    fn ptr_provider(api: &crate::test_support::MockApi, state: &std::path::Path) -> GlesysProvider {
+        toml::from_str(&format!(
             r#"
 api_user="test"
 api_key="test"
-add_endpoint="{}/add"
+domains_endpoint="{0}/domains"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+update_endpoint="{0}/update"
+delete_endpoint="{0}/delete"
+ptr_state_file={1}
 [[records]]
 domain="ignored-for-ptr"
 hostname="ptr"
 type="dynamic-ptr-v4"
 value="home.example.com"
 "#,
-            api.url
+            api.url,
+            serde_json::to_string(&state).unwrap()
         ))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn ptr_failure_is_returned_to_the_retry_loop() {
+        let api = crate::test_support::MockApi::new(vec![
+            (
+                200,
+                json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}}),
+            ),
+            (200, json!({"response":{"records":[]}})),
+            (503, json!({"error":"retry"})),
+        ]);
+        let dir = std::env::temp_dir().join(format!("ptr-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider = ptr_provider(&api, &dir.join("state.json"));
         let ips = ResolvedIps {
             ipv4: Some("192.0.2.1".parse().unwrap()),
             ipv6: None,
@@ -835,6 +879,62 @@ value="home.example.com"
                 .update(&reqwest::blocking::Client::new(), &ips)
                 .is_err()
         );
-        assert_eq!(api.requests().len(), 1);
+        assert_eq!(api.requests().len(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reverse_zone_uses_longest_delegated_suffix() {
+        let zones = vec!["0.192.in-addr.arpa".into(), "2.0.192.in-addr.arpa".into()];
+        assert_eq!(
+            reverse_location("1.2.0.192.in-addr.arpa", &zones).unwrap(),
+            ("1".into(), zones[1].clone())
+        );
+        assert!(reverse_location("1.2.0.193.in-addr.arpa", &zones).is_err());
+        assert_eq!(
+            reverse_location("a.b.c.ip6.arpa", &["c.ip6.arpa".into()])
+                .unwrap()
+                .0,
+            "a.b"
+        );
+    }
+
+    #[test]
+    fn ptr_restart_discovers_existing_record_and_ip_change_cleans_owned_record() {
+        let domains = json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}});
+        let old = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":"home.example.com","ttl":300});
+        let api = crate::test_support::MockApi::new(vec![
+            (200, domains.clone()),
+            (200, json!({"response":{"records":[old.clone()]}})),
+            (200, json!({})),
+            (200, domains),
+            (200, json!({"response":{"records":[old.clone()]}})),
+            (200, json!({"response":{"record":{"recordid":"2"}}})),
+            (200, json!({"response":{"records":[old]}})),
+            (200, json!({})),
+        ]);
+        let dir = std::env::temp_dir().join(format!("ptr-restart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("state.json");
+        let client = reqwest::blocking::Client::new();
+        let first = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        ptr_provider(&api, &state).update(&client, &first).unwrap();
+        let second = ResolvedIps {
+            ipv4: Some("192.0.2.2".parse().unwrap()),
+            ipv6: None,
+        };
+        ptr_provider(&api, &state).update(&client, &second).unwrap();
+        let requests = api.requests();
+        assert_eq!(requests.iter().filter(|(p, _)| p == "/add").count(), 1);
+        assert_eq!(requests.last().unwrap().1["recordid"], "1");
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        let owned = journal.records.values().next().unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].id.as_deref(), Some("2"));
+        drop(journal);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
