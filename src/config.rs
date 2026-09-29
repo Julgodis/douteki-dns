@@ -696,4 +696,9 @@ hostname="home"
         assert!(checked_config("type=\"dynamic-ipv4\"\ninterval_seconds=0").is_err());
         assert!(checked_config("type=\"dynamic-ipv4\"").is_ok());
     }
+    #[test]
+    fn example_configuration_is_valid() {
+        let config: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        config.validate().unwrap();
+    }
 }
