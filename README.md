@@ -89,3 +89,5 @@ cargo fmt --all --check
 cargo check --locked
 cargo test --locked
 ```
+
+Records with the same name and DNS type are matched by their current value. If several records could match a changed value, set `record_id` explicitly; the updater refuses ambiguous updates. Explicit IDs must belong to the configured name, zone, and type.

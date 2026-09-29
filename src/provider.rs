@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, ensure};
@@ -44,19 +44,56 @@ struct RecordKey {
 impl RecordKey {
     fn from_config(record: &GlesysRecord) -> Self {
         Self {
-            domain: record.domain.clone(),
-            host: record.hostname.clone(),
+            domain: record.domain.trim_end_matches('.').to_ascii_lowercase(),
+            host: record.hostname.to_ascii_lowercase(),
             record_type: record.data.dns_record_type().to_string(),
         }
     }
 
     fn from_listed(record: &GlesysListedRecord) -> Self {
         Self {
-            domain: record.domain.clone(),
-            host: record.host.clone(),
-            record_type: record.record_type.clone(),
+            domain: record.domain.trim_end_matches('.').to_ascii_lowercase(),
+            host: record.host.to_ascii_lowercase(),
+            record_type: record.record_type.to_ascii_uppercase(),
         }
     }
+}
+
+// Never guess which member of a record set the user intends to manage.
+fn select_record(
+    record: &GlesysRecord,
+    data: &str,
+    existing: &[GlesysListedRecord],
+    claimed: &HashSet<String>,
+    shared_key: bool,
+) -> Result<Option<String>> {
+    if let Some(id) = &record.record_id {
+        ensure!(
+            existing.iter().any(|r| &r.record_id == id),
+            "record_id {id} does not match {} ({})",
+            record.fqdn(),
+            record.data.dns_record_type()
+        );
+        return Ok(Some(id.clone()));
+    }
+    let candidates: Vec<_> = existing
+        .iter()
+        .filter(|r| !claimed.contains(&r.record_id))
+        .collect();
+    let exact: Vec<_> = candidates.iter().filter(|r| r.data == data).collect();
+    if exact.len() == 1 {
+        return Ok(Some(exact[0].record_id.clone()));
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        !shared_key && candidates.len() == 1,
+        "ambiguous records for {} ({}); set record_id explicitly",
+        record.fqdn(),
+        record.data.dns_record_type()
+    );
+    Ok(Some(candidates[0].record_id.clone()))
 }
 
 impl RecordUpdate {
@@ -163,6 +200,11 @@ impl GlesysProvider {
     ) -> Result<Vec<RecordUpdate>> {
         let mut results = Vec::with_capacity(self.records.len());
         let mut existing_ids = self.fetch_existing_record_ids(client)?;
+        let mut claimed: HashSet<String> = self
+            .records
+            .iter()
+            .filter_map(|r| r.record_id.clone())
+            .collect();
 
         for record in &self.records {
             use crate::config::RecordData;
@@ -259,10 +301,22 @@ impl GlesysProvider {
             }
 
             let key = RecordKey::from_config(record);
-            let record_id = record
-                .record_id
-                .clone()
-                .or_else(|| existing_ids.get(&key).cloned());
+            let shared_key = self
+                .records
+                .iter()
+                .filter(|r| RecordKey::from_config(r) == key)
+                .count()
+                > 1;
+            let record_id = select_record(
+                record,
+                &data,
+                existing_ids
+                    .get(&key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                &claimed,
+                shared_key,
+            )?;
 
             match record_id {
                 Some(ref record_id) => {
@@ -275,7 +329,7 @@ impl GlesysProvider {
                     );
 
                     self.update_record(client, record_id, record, &data)?;
-                    existing_ids.insert(key, record_id.clone());
+                    claimed.insert(record_id.clone());
 
                     results.push(RecordUpdate::updated(
                         record,
@@ -292,7 +346,7 @@ impl GlesysProvider {
                     );
 
                     let created_id = self.create_record(client, record, &data)?;
-                    existing_ids.insert(key, created_id.clone());
+                    claimed.insert(created_id.clone());
 
                     results.push(RecordUpdate::created(record, data, Some(created_id)));
                 }
@@ -305,10 +359,12 @@ impl GlesysProvider {
     fn fetch_existing_record_ids(
         &self,
         client: &reqwest::blocking::Client,
-    ) -> Result<HashMap<RecordKey, String>> {
-        let mut map = HashMap::new();
+    ) -> Result<HashMap<RecordKey, Vec<GlesysListedRecord>>> {
+        let mut map: HashMap<RecordKey, Vec<GlesysListedRecord>> = HashMap::new();
         for record in self.list_records(client)? {
-            map.insert(RecordKey::from_listed(&record), record.record_id.clone());
+            map.entry(RecordKey::from_listed(&record))
+                .or_default()
+                .push(record);
         }
         Ok(map)
     }
@@ -473,7 +529,7 @@ impl GlesysProvider {
         record: &GlesysRecord,
         ip: IpAddr,
         hostname: &str,
-        existing_ids: &mut HashMap<RecordKey, String>,
+        existing_ids: &mut HashMap<RecordKey, Vec<GlesysListedRecord>>,
         results: &mut Vec<RecordUpdate>,
     ) -> Result<()> {
         use crate::config::RecordData;
@@ -497,12 +553,25 @@ impl GlesysProvider {
         };
 
         // Check if we already have a PTR record for this IP
-        let existing_id = existing_ids.get(&ptr_key).cloned();
+        let existing_id = select_record(
+            record,
+            hostname,
+            existing_ids
+                .get(&ptr_key)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &HashSet::new(),
+            false,
+        )?;
 
         // Also check if we have PTR records for the original hostname/domain
         // (from before the IP changed) and delete them
         let original_key = RecordKey::from_config(record);
-        if let Some(old_id) = existing_ids.get(&original_key) {
+        if let Some(old_record) = existing_ids
+            .get(&original_key)
+            .and_then(|records| records.first())
+        {
+            let old_id = &old_record.record_id;
             if original_key != ptr_key {
                 debug!(
                     record_id = %old_id,
@@ -534,8 +603,6 @@ impl GlesysProvider {
 
                 match self.update_record(client, record_id, &ptr_record, hostname) {
                     Ok(_) => {
-                        existing_ids.insert(ptr_key, record_id.clone());
-
                         results.push(RecordUpdate {
                             fqdn: reverse_domain,
                             record_type: "PTR".to_string(),
@@ -569,8 +636,6 @@ impl GlesysProvider {
 
                 match self.create_record(client, &ptr_record, hostname) {
                     Ok(created_id) => {
-                        existing_ids.insert(ptr_key, created_id.clone());
-
                         results.push(RecordUpdate {
                             fqdn: reverse_domain,
                             record_type: "PTR".to_string(),
@@ -681,5 +746,65 @@ where
             "expected string or number, got {}",
             other
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn txt() -> GlesysRecord {
+        toml::from_str(
+            r#"domain="example.com"
+hostname="@"
+type="text"
+record_type="TXT"
+value="one"
+"#,
+        )
+        .unwrap()
+    }
+
+    fn listed(id: &str, data: &str) -> GlesysListedRecord {
+        GlesysListedRecord {
+            record_id: id.into(),
+            domain: "example.com".into(),
+            host: "@".into(),
+            record_type: "TXT".into(),
+            data: data.into(),
+            ttl: 300,
+        }
+    }
+
+    #[test]
+    fn record_sets_match_by_value_or_require_an_explicit_id() {
+        let existing = vec![listed("1", "one"), listed("2", "two")];
+        assert_eq!(
+            select_record(&txt(), "two", &existing, &HashSet::new(), true).unwrap(),
+            Some("2".into())
+        );
+        assert!(select_record(&txt(), "new", &existing, &HashSet::new(), false).is_err());
+        let mut record = txt();
+        record.record_id = Some("1".into());
+        assert_eq!(
+            select_record(&record, "new", &existing, &HashSet::new(), true).unwrap(),
+            Some("1".into())
+        );
+        record.record_id = Some("unknown".into());
+        assert!(select_record(&record, "new", &existing, &HashSet::new(), true).is_err());
+    }
+
+    #[test]
+    fn claimed_records_are_never_reused() {
+        let existing = vec![listed("1", "one")];
+        let claimed = HashSet::from(["1".into()]);
+        assert_eq!(
+            select_record(&txt(), "two", &existing, &claimed, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_record(&txt(), "one", &[], &claimed, true).unwrap(),
+            None
+        );
     }
 }

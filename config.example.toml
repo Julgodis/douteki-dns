@@ -71,13 +71,13 @@ value = "home.example.com"  # The hostname to point to
 ttl = 300
 interval_seconds = 120
 
-# Static text record (TXT) - for SPF, DKIM, etc.
+# Static text record (TXT) - for site verification
 [[provider.records]]
 domain = "example.com"
 hostname = "@"
 type = "text"
 record_type = "TXT"
-value = "v=spf1 include:_spf.google.com ~all"
+value = "site-verification=replace-with-your-token"
 ttl = 3600
 # No interval = set once at startup
 
