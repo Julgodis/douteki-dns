@@ -24,10 +24,15 @@ pub struct ResolveReport {
     pub errors: Vec<String>,
 }
 
-pub fn resolve_all(sources: &IpSources, client: &reqwest::blocking::Client) -> ResolveReport {
+pub fn resolve_required(
+    sources: &IpSources,
+    client: &reqwest::blocking::Client,
+    ipv4_required: bool,
+    ipv6_required: bool,
+) -> ResolveReport {
     let mut errors = Vec::new();
 
-    let ipv4 = match &sources.ipv4 {
+    let ipv4 = match sources.ipv4.as_ref().filter(|_| ipv4_required) {
         Some(source) => match source.resolve(client) {
             Ok(addr) => match ensure_ipv4(addr) {
                 Ok(v4) => Some(v4),
@@ -44,7 +49,7 @@ pub fn resolve_all(sources: &IpSources, client: &reqwest::blocking::Client) -> R
         None => None,
     };
 
-    let ipv6 = match &sources.ipv6 {
+    let ipv6 = match sources.ipv6.as_ref().filter(|_| ipv6_required) {
         Some(source) => match source.resolve(client) {
             Ok(addr) => match ensure_ipv6(addr) {
                 Ok(v6) => Some(v6),
@@ -110,5 +115,25 @@ fn ensure_ipv6(addr: IpAddr) -> Result<Ipv6Addr> {
     match addr {
         IpAddr::V6(v6) => Ok(v6),
         IpAddr::V4(v4) => bail!("expected IPv6 address but received IPv4 {}", v4),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unused_sources_are_not_contacted() {
+        let api = crate::test_support::MockApi::new(vec![]);
+        let sources = IpSources {
+            ipv4: Some(IpSource::Http {
+                url: api.url.clone(),
+            }),
+            ipv6: None,
+        };
+        let report = resolve_required(&sources, &reqwest::blocking::Client::new(), false, false);
+        assert!(report.errors.is_empty());
+        assert!(report.ips.ipv4.is_none());
+        assert!(api.requests().is_empty());
     }
 }

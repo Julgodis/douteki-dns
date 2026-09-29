@@ -136,6 +136,12 @@ impl DnsProvider {
         }
     }
 
+    pub fn records(&self) -> &[GlesysRecord] {
+        match self {
+            Self::Glesys(provider) => &provider.records,
+        }
+    }
+
     pub fn record_count(&self) -> usize {
         match self {
             DnsProvider::Glesys(provider) => provider.records.len(),
@@ -334,14 +340,14 @@ impl RecordData {
         matches!(
             self,
             RecordData::DynamicIpv4 | RecordData::DynamicPtrV4 { .. }
-        )
+        ) || matches!(self, RecordData::Text { value, .. } if value.contains("{ipv4}"))
     }
 
     pub fn requires_ipv6(&self) -> bool {
         matches!(
             self,
             RecordData::DynamicIpv6 | RecordData::DynamicPtrV6 { .. }
-        )
+        ) || matches!(self, RecordData::Text { value, .. } if value.contains("{ipv6}"))
     }
 
     /// Check if this record type needs dynamic IP substitution in its value

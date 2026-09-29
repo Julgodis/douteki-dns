@@ -983,4 +983,41 @@ type="dynamic-ipv4"
         assert_eq!(report.errors[0].0, 1);
         assert_eq!(api.requests().last().unwrap().1["host"], "last");
     }
+    #[test]
+    fn missing_ips_only_skip_dependent_records() {
+        let api = crate::test_support::MockApi::new(vec![
+            (200, json!({"response":{"records":[]}})),
+            (200, json!({"response":{"record":{"recordid":"1"}}})),
+        ]);
+        let provider: GlesysProvider = toml::from_str(&format!(
+            r#"
+api_user="test"
+api_key="test"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+[[records]]
+domain="example.com"
+hostname="dynamic"
+type="dynamic-ipv4"
+[[records]]
+domain="example.com"
+hostname="static"
+type="static"
+record_type="A"
+address="192.0.2.5"
+"#,
+            api.url
+        ))
+        .unwrap();
+        let report = provider.update(
+            &reqwest::blocking::Client::new(),
+            &ResolvedIps {
+                ipv4: None,
+                ipv6: None,
+            },
+        );
+        assert!(report.errors.is_empty());
+        assert_eq!(report.applied, vec![1]);
+        assert_eq!(api.requests().last().unwrap().1["data"], "192.0.2.5");
+    }
 }
