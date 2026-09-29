@@ -112,23 +112,17 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
         let changed = previous_ips.as_ref() != Some(&resolved);
 
         if changed {
-            match config.provider.update(client, &resolved) {
-                Ok(updates) => {
-                    for update in updates {
-                        info!(
-                            fqdn = update.fqdn,
-                            record_type = %update.record_type,
-                            data = %update.data,
-                            outcome = update.outcome.as_str(),
-                            record_id = update.record_id.as_deref(),
-                            "DNS record change applied"
-                        );
-                    }
-                    previous_ips = Some(resolved);
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to push DNS update");
-                }
+            let report = config.provider.update(client, &resolved);
+            for update in report.updates {
+                info!(fqdn = update.fqdn, record_type = %update.record_type,
+                    data = %update.data, outcome = update.outcome.as_str(),
+                    record_id = update.record_id.as_deref(), "DNS record change applied");
+            }
+            for (index, error) in &report.errors {
+                warn!(record = index, error = %error, "Failed to push DNS update");
+            }
+            if report.errors.is_empty() {
+                previous_ips = Some(resolved);
             }
         } else {
             debug!(interval = interval_secs, "No IP change detected");
