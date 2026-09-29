@@ -44,6 +44,7 @@ fn merge_value(base: &mut toml::Value, overlay: toml::Value) {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_user_agent")]
     user_agent: String,
@@ -64,8 +65,36 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        ensure!(
+            self.check_interval_seconds != Some(0),
+            "check_interval_seconds must be greater than zero"
+        );
+        for (family, source) in [
+            ("ipv4", &self.ip_sources.ipv4),
+            ("ipv6", &self.ip_sources.ipv6),
+        ] {
+            match source {
+                Some(IpSource::Static { address }) => ensure!(
+                    address.is_ipv4() == (family == "ipv4"),
+                    "ip_sources.{family} has the wrong address family"
+                ),
+                Some(IpSource::Http { url }) => {
+                    validate_url(url, &format!("ip_sources.{family}.url"))?
+                }
+                None => {}
+            }
+        }
         self.provider.validate(&self.ip_sources)
     }
+}
+
+fn validate_url(url: &str, name: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL for {name}"))?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some(),
+        "{name} must be an HTTP or HTTPS URL"
+    );
+    Ok(())
 }
 
 fn default_user_agent() -> String {
@@ -73,6 +102,7 @@ fn default_user_agent() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IpSources {
     #[serde(default = "default_ipv4_source")]
     pub ipv4: Option<IpSource>,
@@ -94,7 +124,7 @@ fn default_ipv4_source() -> Option<IpSource> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum IpSource {
     Http {
         #[serde(default = "default_public_ip_service")]
@@ -150,6 +180,7 @@ impl DnsProvider {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlesysProvider {
     #[serde(default = "default_domains_endpoint")]
     pub domains_endpoint: String,
@@ -172,11 +203,89 @@ pub struct GlesysProvider {
 impl GlesysProvider {
     fn validate(&self, sources: &IpSources) -> Result<()> {
         ensure!(
+            !self.api_user.trim().is_empty() && !self.api_key.trim().is_empty(),
+            "GleSYS api_user and api_key must not be empty"
+        );
+        for (name, url) in [
+            ("update_endpoint", &self.update_endpoint),
+            ("add_endpoint", &self.add_endpoint),
+            ("list_endpoint", &self.list_endpoint),
+            ("delete_endpoint", &self.delete_endpoint),
+            ("domains_endpoint", &self.domains_endpoint),
+        ] {
+            validate_url(url, name)?;
+        }
+        ensure!(
+            !self.ptr_state_file.as_os_str().is_empty(),
+            "ptr_state_file must not be empty"
+        );
+        let mut ids = std::collections::HashSet::new();
+        let mut definitions = std::collections::HashSet::new();
+        let mut ptr_families = std::collections::HashSet::new();
+        ensure!(
             !self.records.is_empty(),
             "GleSYS provider requires at least one record entry"
         );
 
         for record in &self.records {
+            ensure!(
+                record.interval_seconds != Some(0),
+                "interval_seconds for {} must be greater than zero",
+                record.hostname
+            );
+            if let Some(id) = &record.record_id {
+                ensure!(!id.trim().is_empty(), "record_id must not be empty");
+                ensure!(
+                    ids.insert(id),
+                    "record_id {id} is used by more than one record"
+                );
+            }
+            ensure!(
+                definitions.insert(format!(
+                    "{}|{}|{:?}",
+                    record.domain, record.hostname, record.data
+                )),
+                "duplicate record definition for {}.{}",
+                record.hostname,
+                record.domain
+            );
+            if matches!(
+                record.data,
+                RecordData::DynamicPtrV4 { .. } | RecordData::DynamicPtrV6 { .. }
+            ) {
+                ensure!(
+                    ptr_families.insert(record.data.requires_ipv4()),
+                    "only one dynamic PTR entry per address family is supported"
+                );
+            }
+            if let RecordData::Static {
+                record_type,
+                address,
+            } = record.data
+            {
+                ensure!(
+                    matches!(
+                        (record_type, address),
+                        (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::AAAA, IpAddr::V6(_))
+                    ),
+                    "static record {} has an address incompatible with {record_type}",
+                    record.hostname
+                );
+            }
+            let kind = record.data.dns_record_type();
+            ensure!(
+                !kind.is_empty()
+                    && kind
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+                "record_type must be an uppercase DNS type for {}",
+                record.hostname
+            );
+            ensure!(
+                !record.domain.chars().any(char::is_whitespace)
+                    && !record.hostname.chars().any(char::is_whitespace),
+                "record domain and hostname must not contain whitespace"
+            );
             ensure!(
                 !record.domain.is_empty(),
                 "Record '{}' must specify a domain",
@@ -191,7 +300,7 @@ impl GlesysProvider {
             if record.data.requires_ipv4() {
                 ensure!(
                     sources.ipv4.is_some(),
-                    "Record '{}' with dynamic-ipv4 requires an ipv4 ip_source",
+                    "Record '{}' requires an ipv4 ip_source",
                     record.hostname
                 );
             }
@@ -199,7 +308,7 @@ impl GlesysProvider {
             if record.data.requires_ipv6() {
                 ensure!(
                     sources.ipv6.is_some(),
-                    "Record '{}' with dynamic-ipv6 requires an ipv6 ip_source",
+                    "Record '{}' requires an ipv6 ip_source",
                     record.hostname
                 );
             }
@@ -250,9 +359,40 @@ fn deserialize_records<'de, D>(deserializer: D) -> Result<Vec<GlesysRecord>, D::
 where
     D: Deserializer<'de>,
 {
-    let inputs = Vec::<GlesysRecordInput>::deserialize(deserializer)?;
+    let inputs = Vec::<toml::Value>::deserialize(deserializer)?;
     let mut records = Vec::new();
-    for input in inputs {
+    for value in inputs {
+        let table = value
+            .as_table()
+            .ok_or_else(|| de::Error::custom("record must be a table"))?;
+        let kind = table
+            .get("type")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        let common = [
+            "record_id",
+            "domain",
+            "domains",
+            "hostname",
+            "hostnames",
+            "type",
+            "ttl",
+            "interval_seconds",
+        ];
+        let specific: &[&str] = match kind {
+            "text" => &["record_type", "value"],
+            "static" => &["record_type", "address"],
+            "dynamic-ptr-v4" | "dynamic-ptr-v6" => &["value"],
+            _ => &[],
+        };
+        for key in table.keys() {
+            if !common.contains(&key.as_str()) && !specific.contains(&key.as_str()) {
+                return Err(de::Error::custom(format!(
+                    "unknown field `{key}` in {kind} record"
+                )));
+            }
+        }
+        let input: GlesysRecordInput = value.try_into().map_err(de::Error::custom)?;
         let domains = match (input.domain, input.domains) {
             (Some(domain), None) => vec![domain],
             (None, Some(domains)) if !domains.is_empty() => domains,
@@ -276,8 +416,8 @@ where
             for hostname in &hostnames {
                 records.push(GlesysRecord {
                     record_id: input.record_id.clone(),
-                    domain: domain.clone(),
-                    hostname: hostname.clone(),
+                    domain: domain.trim_end_matches('.').to_ascii_lowercase(),
+                    hostname: hostname.trim_end_matches('.').to_ascii_lowercase(),
                     data: input.data.clone(),
                     ttl: input.ttl,
                     interval_seconds: input.interval_seconds,
@@ -537,5 +677,34 @@ type = "dynamic-ipv4"
             ))
             .is_err()
         );
+    }
+    fn checked_config(extra: &str) -> Result<Config> {
+        let config: Config = toml::from_str(&format!(
+            r#"
+[provider]
+type="glesys"
+api_user="test"
+api_key="test"
+[[provider.records]]
+domain="example.com"
+hostname="home"
+{extra}
+"#
+        ))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn rejects_wrong_families_missing_template_sources_and_unknown_fields() {
+        assert!(
+            checked_config("type=\"static\"\nrecord_type=\"A\"\naddress=\"2001:db8::1\"").is_err()
+        );
+        assert!(
+            checked_config("type=\"text\"\nrecord_type=\"TXT\"\nvalue=\"ip6:{ipv6}\"").is_err()
+        );
+        assert!(checked_config("type=\"dynamic-ipv4\"\nrecordid=\"123\"").is_err());
+        assert!(checked_config("type=\"dynamic-ipv4\"\ninterval_seconds=0").is_err());
+        assert!(checked_config("type=\"dynamic-ipv4\"").is_ok());
     }
 }
