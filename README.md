@@ -70,8 +70,10 @@ Use `domains = ["example.com", "example.net"]` with `hostname = "home"` for the 
 The binary defaults to the `ddns` command. To list records from GleSYS:
 
 ```sh
-cargo run -- --config config.toml glesys list-records
+cargo run -- --config config.toml glesys list-records --domain example.com
 ```
+
+Repeat `--domain` to list several zones, or omit it to list all zones in the account. Listing requires only provider credentials; no managed records or IP sources are needed. Record rows go to stdout and logs go to stderr.
 
 Set `RUST_LOG` to control log detail. For example:
 

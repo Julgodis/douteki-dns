@@ -24,7 +24,6 @@ pub fn load_config(paths: &[impl AsRef<Path>]) -> Result<Config> {
     let config: Config = merged
         .try_into()
         .context("failed to decode merged configuration")?;
-    config.validate()?;
     Ok(config)
 }
 
@@ -64,7 +63,13 @@ impl Config {
         self.check_interval_seconds
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate_provider(&self) -> Result<()> {
+        match &self.provider {
+            DnsProvider::Glesys(provider) => provider.validate_connection(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
         ensure!(
             self.check_interval_seconds != Some(0),
             "check_interval_seconds must be greater than zero"
@@ -201,7 +206,7 @@ pub struct GlesysProvider {
 }
 
 impl GlesysProvider {
-    fn validate(&self, sources: &IpSources) -> Result<()> {
+    fn validate_connection(&self) -> Result<()> {
         ensure!(
             !self.api_user.trim().is_empty() && !self.api_key.trim().is_empty(),
             "GleSYS api_user and api_key must not be empty"
@@ -219,6 +224,11 @@ impl GlesysProvider {
             !self.ptr_state_file.as_os_str().is_empty(),
             "ptr_state_file must not be empty"
         );
+        Ok(())
+    }
+
+    fn validate(&self, sources: &IpSources) -> Result<()> {
+        self.validate_connection()?;
         let mut ids = std::collections::HashSet::new();
         let mut definitions = std::collections::HashSet::new();
         let mut ptr_families = std::collections::HashSet::new();
