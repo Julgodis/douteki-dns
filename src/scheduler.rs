@@ -64,6 +64,11 @@ impl Scheduler {
         (!entry.ipv4 && !entry.ipv6) || entry.last_applied.as_ref() != Some(&relevant)
     }
 
+    pub fn failed(&mut self, index: usize) {
+        // A failed request can have taken effect remotely; the old success is no longer reliable.
+        self.entries[index].last_applied = None;
+    }
+
     pub fn finish(&mut self, due: &[usize], applied: &[usize], ips: &ResolvedIps, now: Duration) {
         for index in due {
             let entry = &mut self.entries[*index];

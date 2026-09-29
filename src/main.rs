@@ -1,10 +1,12 @@
 mod config;
+mod desired;
 mod ip;
 mod provider;
 mod scheduler;
 mod state;
 #[cfg(test)]
 mod test_support;
+mod updater;
 
 use std::path::PathBuf;
 use std::thread;
@@ -97,21 +99,11 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
     let mut scheduler = scheduler::Scheduler::new(config.provider.records(), interval_secs);
     let started = Instant::now();
     loop {
-        let due = scheduler.due(started.elapsed());
-        let (ipv4, ipv6) = scheduler.required_ips(&due);
-        let ip::ResolveReport {
-            ips: resolved,
-            errors,
-        } = ip::resolve_required(&config.ip_sources, client, ipv4, ipv6);
-        for error in errors {
+        let cycle = updater::cycle(config, client, &mut scheduler, || started.elapsed());
+        for error in cycle.source_errors {
             warn!(error = %error, "Failed to determine current IP address");
         }
-        let selected: Vec<_> = due
-            .iter()
-            .copied()
-            .filter(|i| scheduler.needs_update(*i, &resolved))
-            .collect();
-        let report = config.provider.update(client, &resolved, &selected);
+        let report = cycle.updates;
         for update in report.updates {
             info!(fqdn = update.fqdn, record_type = %update.record_type,
                 data = %update.data, outcome = update.outcome.as_str(),
@@ -120,7 +112,6 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
         for (index, error) in &report.errors {
             warn!(record = index, error = %error, "Failed to push DNS update");
         }
-        scheduler.finish(&due, &report.applied, &resolved, started.elapsed());
         thread::sleep(scheduler.delay(started.elapsed()));
     }
 }
