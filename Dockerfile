@@ -8,6 +8,7 @@ RUN apt-get update \
 # Cache dependencies separately and warm registry using cache mounts.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY config.example.toml ./config.example.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     cargo fetch --locked
