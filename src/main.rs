@@ -92,19 +92,23 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
         let ip::ResolveReport {
             ips: resolved,
             errors,
-        } = ip::resolve_all(&config.ip_sources, client);
+        } = ip::resolve_required(
+            &config.ip_sources,
+            client,
+            config
+                .provider
+                .records()
+                .iter()
+                .any(|r| r.data.requires_ipv4()),
+            config
+                .provider
+                .records()
+                .iter()
+                .any(|r| r.data.requires_ipv6()),
+        );
 
         for error in &errors {
             warn!(error = %error, "Failed to determine current IP address");
-        }
-
-        if resolved.ipv4.is_none() && resolved.ipv6.is_none() {
-            warn!(
-                interval = interval_secs,
-                "No IP addresses resolved; skipping update cycle"
-            );
-            thread::sleep(interval);
-            continue;
         }
 
         debug!(?resolved, "Resolved IP addresses");
