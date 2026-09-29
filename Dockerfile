@@ -1,4 +1,6 @@
-FROM rust:slim AS builder
+# Keep the builder on the same Debian release as the runtime so the binary
+# doesn't require newer glibc symbols than the final image provides.
+FROM rust:slim-bookworm AS builder
 WORKDIR /src
 
 RUN apt-get update \
@@ -14,15 +16,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     cargo fetch --locked
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/src/target,id=douteki-target \
-    cargo build --release --locked
+    --mount=type=cache,target=/src/target,id=douteki-target-bookworm \
+    cargo build --release --locked --bin douteki-dns
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/src/target,id=douteki-target \
+    --mount=type=cache,target=/src/target,id=douteki-target-bookworm \
     cargo test --release --locked
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
-    --mount=type=cache,target=/src/target,id=douteki-target \
+    --mount=type=cache,target=/src/target,id=douteki-target-bookworm \
     cp ./target/release/douteki-dns /usr/local/bin/douteki-dns
 
 FROM debian:bookworm-slim
