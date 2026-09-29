@@ -618,6 +618,7 @@ impl GlesysProvider {
                             error = %err,
                             "Failed to update PTR record"
                         );
+                        return Err(err);
                     }
                 }
             }
@@ -651,6 +652,7 @@ impl GlesysProvider {
                             error = %err,
                             "Failed to create PTR record - reverse DNS zone may not be delegated to this account"
                         );
+                        return Err(err);
                     }
                 }
             }
@@ -806,5 +808,33 @@ value="one"
             select_record(&txt(), "one", &[], &claimed, true).unwrap(),
             None
         );
+    }
+    #[test]
+    fn ptr_failure_is_returned_to_the_retry_loop() {
+        let api = crate::test_support::MockApi::new(vec![(503, json!({"error":"retry"}))]);
+        let provider: GlesysProvider = toml::from_str(&format!(
+            r#"
+api_user="test"
+api_key="test"
+add_endpoint="{}/add"
+[[records]]
+domain="ignored-for-ptr"
+hostname="ptr"
+type="dynamic-ptr-v4"
+value="home.example.com"
+"#,
+            api.url
+        ))
+        .unwrap();
+        let ips = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        assert!(
+            provider
+                .update(&reqwest::blocking::Client::new(), &ips)
+                .is_err()
+        );
+        assert_eq!(api.requests().len(), 1);
     }
 }
