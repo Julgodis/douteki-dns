@@ -1,6 +1,7 @@
 mod config;
 mod ip;
 mod provider;
+mod state;
 #[cfg(test)]
 mod test_support;
 

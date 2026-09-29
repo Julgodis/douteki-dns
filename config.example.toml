@@ -18,6 +18,8 @@ api_key = "REPLACE_WITH_GLESYS_API_KEY"
 update_endpoint = "https://api.glesys.com/domain/updaterecord"
 add_endpoint = "https://api.glesys.com/domain/addrecord"
 list_endpoint = "https://api.glesys.com/domain/listrecords"
+# ptr_state_file = "/data/ptr-state.json" # persistent writable storage for PTR ownership
+# domains_endpoint = "https://api.glesys.com/domain/list"
 delete_endpoint = "https://api.glesys.com/domain/deleterecord"
 
 # Dynamic IPv4 records (A) - both names use the same resolved IPv4 address

@@ -145,6 +145,10 @@ impl DnsProvider {
 
 #[derive(Debug, Deserialize)]
 pub struct GlesysProvider {
+    #[serde(default = "default_domains_endpoint")]
+    pub domains_endpoint: String,
+    #[serde(default = "default_ptr_state_file")]
+    pub ptr_state_file: std::path::PathBuf,
     pub api_user: String,
     pub api_key: String,
     #[serde(default = "default_glesys_update_endpoint")]
@@ -401,6 +405,14 @@ pub type RecordType = DnsRecordType;
 
 fn default_glesys_ttl() -> u32 {
     300
+}
+
+fn default_domains_endpoint() -> String {
+    "https://api.glesys.com/domain/list".into()
+}
+
+fn default_ptr_state_file() -> std::path::PathBuf {
+    "ptr-state.json".into()
 }
 
 fn default_glesys_update_endpoint() -> String {
