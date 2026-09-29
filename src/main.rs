@@ -1,6 +1,8 @@
 mod config;
 mod ip;
 mod provider;
+#[cfg(test)]
+mod test_support;
 
 use std::path::PathBuf;
 use std::thread;
