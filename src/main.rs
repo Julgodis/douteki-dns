@@ -20,6 +20,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = config::load_config(&cli.config).context("failed to load configuration")?;
 
+    match &cli.command {
+        None | Some(Command::Ddns) => config.validate()?,
+        Some(Command::Glesys { .. }) => config.validate_provider()?,
+    }
     let client = build_client(&config)?;
 
     match cli.command {
@@ -58,7 +62,11 @@ enum Command {
 #[derive(Subcommand, Debug, Clone)]
 enum GlesysCommand {
     /// List DNS records via the GleSYS API
-    ListRecords,
+    ListRecords {
+        /// DNS zone to list; repeat for several zones. Defaults to all account zones.
+        #[arg(long = "domain", value_name = "ZONE")]
+        domains: Vec<String>,
+    },
 }
 
 fn build_client(config: &config::Config) -> Result<reqwest::blocking::Client> {
@@ -124,8 +132,8 @@ fn run_glesys_command(
 ) -> Result<()> {
     match provider {
         config::DnsProvider::Glesys(cfg) => match command {
-            GlesysCommand::ListRecords => {
-                let records = cfg.list_records(client)?;
+            GlesysCommand::ListRecords { domains } => {
+                let records = cfg.list_records(client, &domains)?;
                 if records.is_empty() {
                     info!("No records returned by GleSYS");
                 } else {
@@ -186,6 +194,7 @@ fn init_tracing() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init()
         .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
     Ok(())
@@ -214,5 +223,38 @@ mod tests {
             Cli::try_parse_from(["douteki-dns"]).unwrap().config,
             [PathBuf::from("config.toml")]
         );
+    }
+    #[test]
+    fn list_records_accepts_credentials_only_and_explicit_zones() {
+        let api = crate::test_support::MockApi::new(vec![(
+            200,
+            serde_json::json!({"response":{"records":[]}}),
+        )]);
+        let config: config::Config = toml::from_str(&format!(
+            r#"
+[provider]
+type="glesys"
+api_user="test"
+api_key="test"
+list_endpoint="{}/list"
+"#,
+            api.url
+        ))
+        .unwrap();
+        config.validate_provider().unwrap();
+        assert!(config.validate().is_err());
+        let cli = Cli::try_parse_from([
+            "douteki-dns",
+            "glesys",
+            "list-records",
+            "--domain",
+            "example.com",
+        ])
+        .unwrap();
+        let Some(Command::Glesys { command }) = cli.command else {
+            panic!("missing command")
+        };
+        run_glesys_command(&config.provider, &build_client(&config).unwrap(), command).unwrap();
+        assert_eq!(api.requests()[0].1["domainname"], "example.com");
     }
 }

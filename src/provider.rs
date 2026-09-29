@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, ensure};
@@ -145,8 +145,16 @@ impl GlesysProvider {
     pub fn list_records(
         &self,
         client: &reqwest::blocking::Client,
+        domains: &[String],
     ) -> Result<Vec<GlesysListedRecord>> {
-        self.list_domains_records(client, self.unique_domains())
+        let discovered;
+        let domains = if domains.is_empty() {
+            discovered = self.list_domains(client)?;
+            &discovered
+        } else {
+            domains
+        };
+        self.list_domains_records(client, domains.iter().map(String::as_str))
     }
 
     fn list_domains_records<'a>(
@@ -671,21 +679,6 @@ impl GlesysProvider {
             journal.save()?;
         }
         Ok(())
-    }
-
-    fn unique_domains(&self) -> BTreeSet<&str> {
-        use crate::config::RecordData;
-        self.records
-            .iter()
-            .filter(|record| {
-                // Skip PTR records as their domains are computed dynamically from IPs
-                !matches!(
-                    record.data,
-                    RecordData::DynamicPtrV4 { .. } | RecordData::DynamicPtrV6 { .. }
-                )
-            })
-            .map(|record| record.domain.as_str())
-            .collect()
     }
 }
 
