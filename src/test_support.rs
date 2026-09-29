@@ -68,7 +68,10 @@ impl MockApi {
                 let (status, body) = responses
                     .pop_front()
                     .unwrap_or((500, Value::String("unexpected request".into())));
-                let body = body.to_string();
+                let body = match body {
+                    Value::String(body) => body,
+                    other => other.to_string(),
+                };
                 write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
@@ -89,5 +92,34 @@ impl Drop for MockApi {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.worker.take().unwrap().join().unwrap();
+    }
+}
+
+pub struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "douteki-test-{}-{unique}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

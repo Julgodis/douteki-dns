@@ -67,3 +67,31 @@ impl PtrJournal {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_round_trips_and_excludes_concurrent_writers() {
+        let dir = crate::test_support::TempDir::new();
+        let path = dir.path().join("state.json");
+        let mut journal = PtrJournal::open(&path).unwrap();
+        assert!(PtrJournal::open(&path).is_err());
+        journal.records.insert(
+            "entry".into(),
+            vec![OwnedPtr {
+                domain: "2.0.192.in-addr.arpa".into(),
+                host: "1".into(),
+                data: "home.example.com".into(),
+                id: Some("1".into()),
+            }],
+        );
+        journal.save().unwrap();
+        let expected = journal.records.clone();
+        drop(journal);
+        assert_eq!(PtrJournal::open(&path).unwrap().records, expected);
+        fs::write(&path, "corrupt state").unwrap();
+        assert!(PtrJournal::open(&path).is_err());
+    }
+}

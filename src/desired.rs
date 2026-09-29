@@ -29,3 +29,26 @@ pub fn resolve(data: &RecordData, ips: &ResolvedIps) -> Option<DesiredData> {
     };
     Some(DesiredData { value, ptr_ip })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn templates_require_all_referenced_families_and_replace_every_occurrence() {
+        let data = RecordData::Text {
+            record_type: "TXT".into(),
+            value: "{ipv4} {ipv6} {ipv4}".into(),
+        };
+        let mut ips = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        assert!(resolve(&data, &ips).is_none());
+        ips.ipv6 = Some("2001:db8::1".parse().unwrap());
+        assert_eq!(
+            resolve(&data, &ips).unwrap().value,
+            "192.0.2.1 2001:db8::1 192.0.2.1"
+        );
+    }
+}

@@ -159,4 +159,15 @@ mod tests {
         assert!(scheduler.needs_update(1, &ips));
         assert_eq!(scheduler.due(Duration::from_secs(5)), vec![1]);
     }
+    #[test]
+    fn failed_migration_is_retried_even_if_address_returns_to_previous_value() {
+        let mut scheduler = Scheduler::new(&[record("dynamic-ipv4", None)], 1);
+        let original = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        scheduler.finish(&[0], &[0], &original, Duration::ZERO);
+        scheduler.failed(0);
+        assert!(scheduler.needs_update(0, &original));
+    }
 }

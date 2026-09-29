@@ -813,4 +813,151 @@ address="192.0.2.5"
         assert_eq!(report.applied, vec![1]);
         assert_eq!(api.requests().last().unwrap().1["data"], "192.0.2.5");
     }
+    #[test]
+    fn ptr_migration_failures_preserve_ownership_until_cleanup_succeeds() {
+        let domains = json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}});
+        let old = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":"home.example.com","ttl":300});
+        let new = json!({"recordid":"2","domainname":"2.0.192.in-addr.arpa","host":"2","type":"PTR","data":"home.example.com","ttl":300});
+        let listed = json!({"response":{"records":[old.clone()]}});
+        let api = crate::test_support::MockApi::new(vec![
+            (200, domains.clone()),
+            (200, listed.clone()),
+            (200, json!({})),
+            (200, domains.clone()),
+            (200, listed.clone()),
+            (503, json!({"error":"add failed"})),
+            (200, domains.clone()),
+            (200, listed.clone()),
+            (200, json!({"response":{"record":{"recordid":"2"}}})),
+            (200, listed.clone()),
+            (503, json!({"error":"delete failed"})),
+            (200, domains),
+            (200, json!({"response":{"records":[old,new]}})),
+            (200, json!({})),
+            (200, listed),
+            (200, json!({})),
+        ]);
+        let dir = crate::test_support::TempDir::new();
+        let state = dir.path().join("state.json");
+        let client = reqwest::blocking::Client::new();
+        let first = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        let second = ResolvedIps {
+            ipv4: Some("192.0.2.2".parse().unwrap()),
+            ipv6: None,
+        };
+        assert!(
+            ptr_provider(&api, &state)
+                .update(&client, &first)
+                .errors
+                .is_empty()
+        );
+        assert_eq!(
+            ptr_provider(&api, &state)
+                .update(&client, &second)
+                .errors
+                .len(),
+            1
+        );
+        assert!(!api.requests().iter().any(|(path, _)| path == "/delete"));
+        let partial = ptr_provider(&api, &state).update(&client, &second);
+        assert_eq!(partial.errors.len(), 1);
+        assert_eq!(partial.updates.len(), 1);
+        {
+            let state = crate::state::PtrJournal::open(&state).unwrap();
+            assert_eq!(state.records.values().next().unwrap().len(), 2);
+        }
+        assert!(
+            ptr_provider(&api, &state)
+                .update(&client, &second)
+                .errors
+                .is_empty()
+        );
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        assert_eq!(journal.records.values().next().unwrap().len(), 1);
+        assert_eq!(
+            api.requests()
+                .iter()
+                .filter(|(path, _)| path == "/add")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ptr_address_families_have_separate_ownership_even_with_identical_labels() {
+        let api = crate::test_support::MockApi::new(vec![
+            (
+                200,
+                json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}}),
+            ),
+            (200, json!({"response":{"records":[]}})),
+            (200, json!({"response":{"record":{"recordid":"4"}}})),
+            (
+                200,
+                json!({"response":{"domains":[{"domainname":"ip6.arpa"}]}}),
+            ),
+            (200, json!({"response":{"records":[]}})),
+            (200, json!({"response":{"record":{"recordid":"6"}}})),
+        ]);
+        let dir = crate::test_support::TempDir::new();
+        let state = dir.path().join("state.json");
+        let mut provider = ptr_provider(&api, &state);
+        let mut v6 = provider.records[0].clone();
+        v6.data = crate::config::RecordData::DynamicPtrV6 {
+            value: "home.example.com".into(),
+        };
+        provider.records.push(v6);
+        let ips = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: Some("2001:db8::1".parse().unwrap()),
+        };
+        assert!(
+            provider
+                .update(&reqwest::blocking::Client::new(), &ips)
+                .errors
+                .is_empty()
+        );
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        assert_eq!(journal.records.len(), 2);
+        assert!(!api.requests().iter().any(|(path, _)| path == "/delete"));
+    }
+
+    #[test]
+    fn failed_zone_listing_does_not_block_another_zone() {
+        let api = crate::test_support::MockApi::new(vec![
+            (403, json!({"error":"forbidden"})),
+            (200, json!({"response":{"records":[]}})),
+            (200, json!({"response":{"record":{"recordid":"1"}}})),
+        ]);
+        let provider: GlesysProvider = toml::from_str(&format!(
+            r#"
+api_user="test"
+api_key="test"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+[[records]]
+domains=["broken.example","healthy.example"]
+hostname="home"
+type="dynamic-ipv4"
+"#,
+            api.url
+        ))
+        .unwrap();
+        let report = provider.update(
+            &reqwest::blocking::Client::new(),
+            &ResolvedIps {
+                ipv4: Some("192.0.2.1".parse().unwrap()),
+                ipv6: None,
+            },
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.applied, [1]);
+        assert_eq!(
+            api.requests().last().unwrap().1["domainname"],
+            "healthy.example"
+        );
+    }
 }

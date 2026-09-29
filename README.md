@@ -91,7 +91,10 @@ Issues and pull requests are welcome. Before submitting changes, run:
 cargo fmt --all --check
 cargo check --locked
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
+
+Tests use local mock HTTP servers and a controlled clock to exercise update cycles, failures, PTR migration and restart recovery, configuration validation, and the executable CLI without contacting GleSYS.
 
 Records with the same name and DNS type are matched by their current value. If several records could match a changed value, set `record_id` explicitly; the updater refuses ambiguous updates. Explicit IDs must belong to the configured name, zone, and type.
 
