@@ -10,6 +10,13 @@ use tracing::{debug, warn};
 use crate::config::{DnsProvider, GlesysProvider, GlesysRecord};
 use crate::ip::ResolvedIps;
 
+#[derive(Debug, Default)]
+pub struct UpdateReport {
+    pub updates: Vec<RecordUpdate>,
+    pub errors: Vec<(usize, String)>,
+    pub applied: Vec<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordUpdate {
     pub fqdn: String,
@@ -122,11 +129,7 @@ impl RecordUpdate {
 }
 
 impl DnsProvider {
-    pub fn update(
-        &self,
-        client: &reqwest::blocking::Client,
-        ips: &ResolvedIps,
-    ) -> Result<Vec<RecordUpdate>> {
+    pub fn update(&self, client: &reqwest::blocking::Client, ips: &ResolvedIps) -> UpdateReport {
         match self {
             DnsProvider::Glesys(config) => config.update(client, ips),
         }
@@ -201,173 +204,169 @@ impl GlesysProvider {
         Ok(aggregated)
     }
 
-    fn update(
-        &self,
-        client: &reqwest::blocking::Client,
-        ips: &ResolvedIps,
-    ) -> Result<Vec<RecordUpdate>> {
-        let mut results = Vec::with_capacity(self.records.len());
-        let existing_ids = self.fetch_existing_record_ids(client)?;
+    fn update(&self, client: &reqwest::blocking::Client, ips: &ResolvedIps) -> UpdateReport {
+        let mut report = UpdateReport::default();
+        let mut existing: HashMap<String, Result<Vec<GlesysListedRecord>>> = HashMap::new();
         let mut claimed: HashSet<String> = self
             .records
             .iter()
             .filter_map(|r| r.record_id.clone())
             .collect();
 
-        for record in &self.records {
-            use crate::config::RecordData;
+        for (index, record) in self.records.iter().enumerate() {
+            let mut results = Vec::new();
+            let outcome = (|| -> Result<bool> {
+                use crate::config::RecordData;
 
-            // Determine the data value and handle PTR records specially
-            let (data, ptr_info) = match &record.data {
-                RecordData::DynamicIpv4 => {
-                    let Some(ip) = ips.ipv4 else {
-                        warn!(
-                            record_id = record.record_id.as_deref(),
-                            fqdn = %record.fqdn(),
-                            "Skipping dynamic-ipv4 record; no resolved IPv4"
-                        );
-                        continue;
-                    };
-                    (ip.to_string(), None)
-                }
-                RecordData::DynamicIpv6 => {
-                    let Some(ip) = ips.ipv6 else {
-                        warn!(
-                            record_id = record.record_id.as_deref(),
-                            fqdn = %record.fqdn(),
-                            "Skipping dynamic-ipv6 record; no resolved IPv6"
-                        );
-                        continue;
-                    };
-                    (ip.to_string(), None)
-                }
-                RecordData::DynamicPtrV4 { value } => {
-                    let Some(ip) = ips.ipv4 else {
-                        warn!(
-                            record_id = record.record_id.as_deref(),
-                            hostname = %record.hostname,
-                            "Skipping dynamic-ptr-v4 record; no resolved IPv4"
-                        );
-                        continue;
-                    };
-                    (value.clone(), Some((IpAddr::V4(ip), value.clone())))
-                }
-                RecordData::DynamicPtrV6 { value } => {
-                    let Some(ip) = ips.ipv6 else {
-                        warn!(
-                            record_id = record.record_id.as_deref(),
-                            hostname = %record.hostname,
-                            "Skipping dynamic-ptr-v6 record; no resolved IPv6"
-                        );
-                        continue;
-                    };
-                    (value.clone(), Some((IpAddr::V6(ip), value.clone())))
-                }
-                RecordData::Text { value, .. } => {
-                    // Check if the text value needs IP substitution
-                    let mut substituted = value.clone();
-                    if value.contains("{ipv4}") {
-                        if let Some(ip) = ips.ipv4 {
-                            substituted = substituted.replace("{ipv4}", &ip.to_string());
-                        } else {
+                // Determine the data value and handle PTR records specially
+                let (data, ptr_info) = match &record.data {
+                    RecordData::DynamicIpv4 => {
+                        let Some(ip) = ips.ipv4 else {
                             warn!(
                                 record_id = record.record_id.as_deref(),
                                 fqdn = %record.fqdn(),
-                                "Text record contains {{ipv4}} but no IPv4 resolved; skipping"
+                                "Skipping dynamic-ipv4 record; no resolved IPv4"
                             );
-                            continue;
-                        }
+                            return Ok(false);
+                        };
+                        (ip.to_string(), None)
                     }
-                    if value.contains("{ipv6}") {
-                        if let Some(ip) = ips.ipv6 {
-                            substituted = substituted.replace("{ipv6}", &ip.to_string());
-                        } else {
+                    RecordData::DynamicIpv6 => {
+                        let Some(ip) = ips.ipv6 else {
                             warn!(
                                 record_id = record.record_id.as_deref(),
                                 fqdn = %record.fqdn(),
-                                "Text record contains {{ipv6}} but no IPv6 resolved; skipping"
+                                "Skipping dynamic-ipv6 record; no resolved IPv6"
                             );
-                            continue;
-                        }
+                            return Ok(false);
+                        };
+                        (ip.to_string(), None)
                     }
-                    (substituted, None)
+                    RecordData::DynamicPtrV4 { value } => {
+                        let Some(ip) = ips.ipv4 else {
+                            warn!(
+                                record_id = record.record_id.as_deref(),
+                                hostname = %record.hostname,
+                                "Skipping dynamic-ptr-v4 record; no resolved IPv4"
+                            );
+                            return Ok(false);
+                        };
+                        (value.clone(), Some((IpAddr::V4(ip), value.clone())))
+                    }
+                    RecordData::DynamicPtrV6 { value } => {
+                        let Some(ip) = ips.ipv6 else {
+                            warn!(
+                                record_id = record.record_id.as_deref(),
+                                hostname = %record.hostname,
+                                "Skipping dynamic-ptr-v6 record; no resolved IPv6"
+                            );
+                            return Ok(false);
+                        };
+                        (value.clone(), Some((IpAddr::V6(ip), value.clone())))
+                    }
+                    RecordData::Text { value, .. } => {
+                        // Check if the text value needs IP substitution
+                        let mut substituted = value.clone();
+                        if value.contains("{ipv4}") {
+                            if let Some(ip) = ips.ipv4 {
+                                substituted = substituted.replace("{ipv4}", &ip.to_string());
+                            } else {
+                                warn!(
+                                    record_id = record.record_id.as_deref(),
+                                    fqdn = %record.fqdn(),
+                                    "Text record contains {{ipv4}} but no IPv4 resolved; skipping"
+                                );
+                                return Ok(false);
+                            }
+                        }
+                        if value.contains("{ipv6}") {
+                            if let Some(ip) = ips.ipv6 {
+                                substituted = substituted.replace("{ipv6}", &ip.to_string());
+                            } else {
+                                warn!(
+                                    record_id = record.record_id.as_deref(),
+                                    fqdn = %record.fqdn(),
+                                    "Text record contains {{ipv6}} but no IPv6 resolved; skipping"
+                                );
+                                return Ok(false);
+                            }
+                        }
+                        (substituted, None)
+                    }
+                    RecordData::Static { address, .. } => (address.to_string(), None),
+                };
+
+                // For PTR records, we need to handle them differently
+                if let Some((ip, hostname)) = ptr_info {
+                    self.handle_ptr_record(client, record, ip, &hostname, &mut results)?;
+                    return Ok(true);
                 }
-                RecordData::Static { address, .. } => (address.to_string(), None),
-            };
 
-            // For PTR records, we need to handle them differently
-            if let Some((ip, hostname)) = ptr_info {
-                self.handle_ptr_record(client, record, ip, &hostname, &mut results)?;
-                continue;
-            }
+                let key = RecordKey::from_config(record);
+                let shared_key = self
+                    .records
+                    .iter()
+                    .filter(|r| RecordKey::from_config(r) == key)
+                    .count()
+                    > 1;
+                let records = existing
+                    .entry(record.domain.clone())
+                    .or_insert_with(|| self.list_domains_records(client, [record.domain.as_str()]));
+                let records = records
+                    .as_ref()
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                let candidates: Vec<_> = records
+                    .iter()
+                    .filter(|r| RecordKey::from_listed(r) == key)
+                    .cloned()
+                    .collect();
+                let record_id = select_record(record, &data, &candidates, &claimed, shared_key)?;
 
-            let key = RecordKey::from_config(record);
-            let shared_key = self
-                .records
-                .iter()
-                .filter(|r| RecordKey::from_config(r) == key)
-                .count()
-                > 1;
-            let record_id = select_record(
-                record,
-                &data,
-                existing_ids
-                    .get(&key)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-                &claimed,
-                shared_key,
-            )?;
+                match record_id {
+                    Some(ref record_id) => {
+                        debug!(
+                            record_id = %record_id,
+                            fqdn = %record.fqdn(),
+                            record_type = %record.data.dns_record_type(),
+                            data = %data,
+                            "Preparing GleSYS update"
+                        );
 
-            match record_id {
-                Some(ref record_id) => {
-                    debug!(
-                        record_id = %record_id,
-                        fqdn = %record.fqdn(),
-                        record_type = %record.data.dns_record_type(),
-                        data = %data,
-                        "Preparing GleSYS update"
-                    );
+                        claimed.insert(record_id.clone());
+                        self.update_record(client, record_id, record, &data)?;
 
-                    self.update_record(client, record_id, record, &data)?;
-                    claimed.insert(record_id.clone());
+                        results.push(RecordUpdate::updated(
+                            record,
+                            data.clone(),
+                            Some(record_id.clone()),
+                        ));
+                    }
+                    None => {
+                        debug!(
+                            fqdn = %record.fqdn(),
+                            record_type = %record.data.dns_record_type(),
+                            data = %data,
+                            "Preparing GleSYS addrecord"
+                        );
 
-                    results.push(RecordUpdate::updated(
-                        record,
-                        data.clone(),
-                        Some(record_id.clone()),
-                    ));
+                        let created_id = self.create_record(client, record, &data)?;
+                        claimed.insert(created_id.clone());
+
+                        results.push(RecordUpdate::created(record, data, Some(created_id)));
+                    }
                 }
-                None => {
-                    debug!(
-                        fqdn = %record.fqdn(),
-                        record_type = %record.data.dns_record_type(),
-                        data = %data,
-                        "Preparing GleSYS addrecord"
-                    );
-
-                    let created_id = self.create_record(client, record, &data)?;
-                    claimed.insert(created_id.clone());
-
-                    results.push(RecordUpdate::created(record, data, Some(created_id)));
-                }
+                Ok(true)
+            })();
+            report.updates.extend(results);
+            match outcome {
+                Ok(true) => report.applied.push(index),
+                Ok(false) => {}
+                Err(error) => report
+                    .errors
+                    .push((index, format!("{}: {error:#}", record.fqdn()))),
             }
         }
-
-        Ok(results)
-    }
-
-    fn fetch_existing_record_ids(
-        &self,
-        client: &reqwest::blocking::Client,
-    ) -> Result<HashMap<RecordKey, Vec<GlesysListedRecord>>> {
-        let mut map: HashMap<RecordKey, Vec<GlesysListedRecord>> = HashMap::new();
-        for record in self.list_records(client)? {
-            map.entry(RecordKey::from_listed(&record))
-                .or_default()
-                .push(record);
-        }
-        Ok(map)
+        report
     }
 
     fn update_record(
@@ -721,7 +720,7 @@ struct GlesysListResponseBody {
     records: Vec<GlesysListedRecord>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct GlesysListedRecord {
     #[serde(rename = "recordid", deserialize_with = "deserialize_stringlike")]
     pub record_id: String,
@@ -874,10 +873,12 @@ value="home.example.com"
             ipv4: Some("192.0.2.1".parse().unwrap()),
             ipv6: None,
         };
-        assert!(
+        assert_eq!(
             provider
                 .update(&reqwest::blocking::Client::new(), &ips)
-                .is_err()
+                .errors
+                .len(),
+            1
         );
         assert_eq!(api.requests().len(), 3);
         std::fs::remove_dir_all(dir).unwrap();
@@ -921,12 +922,22 @@ value="home.example.com"
             ipv4: Some("192.0.2.1".parse().unwrap()),
             ipv6: None,
         };
-        ptr_provider(&api, &state).update(&client, &first).unwrap();
+        assert!(
+            ptr_provider(&api, &state)
+                .update(&client, &first)
+                .errors
+                .is_empty()
+        );
         let second = ResolvedIps {
             ipv4: Some("192.0.2.2".parse().unwrap()),
             ipv6: None,
         };
-        ptr_provider(&api, &state).update(&client, &second).unwrap();
+        assert!(
+            ptr_provider(&api, &state)
+                .update(&client, &second)
+                .errors
+                .is_empty()
+        );
         let requests = api.requests();
         assert_eq!(requests.iter().filter(|(p, _)| p == "/add").count(), 1);
         assert_eq!(requests.last().unwrap().1["recordid"], "1");
@@ -936,5 +947,40 @@ value="home.example.com"
         assert_eq!(owned[0].id.as_deref(), Some("2"));
         drop(journal);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_record_does_not_hide_successes_or_block_later_records() {
+        let api = crate::test_support::MockApi::new(vec![
+            (200, json!({"response":{"records":[]}})),
+            (200, json!({"response":{"record":{"recordid":"1"}}})),
+            (503, json!({"error":"broken"})),
+            (200, json!({"response":{"record":{"recordid":"3"}}})),
+        ]);
+        let provider: GlesysProvider = toml::from_str(&format!(
+            r#"
+api_user="test"
+api_key="test"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+[[records]]
+domain="example.com"
+hostnames=["first","broken","last"]
+type="dynamic-ipv4"
+"#,
+            api.url
+        ))
+        .unwrap();
+        let report = provider.update(
+            &reqwest::blocking::Client::new(),
+            &ResolvedIps {
+                ipv4: Some("192.0.2.1".parse().unwrap()),
+                ipv6: None,
+            },
+        );
+        assert_eq!(report.applied, vec![0, 2]);
+        assert_eq!(report.updates.len(), 2);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].0, 1);
+        assert_eq!(api.requests().last().unwrap().1["host"], "last");
     }
 }
