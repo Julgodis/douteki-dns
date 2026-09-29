@@ -276,7 +276,7 @@ impl GlesysProvider {
                 ensure!(
                     matches!(
                         (record_type, address),
-                        (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::AAAA, IpAddr::V6(_))
+                        (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::Aaaa, IpAddr::V6(_))
                     ),
                     "static record {} has an address incompatible with {record_type}",
                     record.hostname
@@ -476,16 +476,6 @@ impl RecordData {
         }
     }
 
-    pub fn is_dynamic(&self) -> bool {
-        matches!(
-            self,
-            RecordData::DynamicIpv4
-                | RecordData::DynamicIpv6
-                | RecordData::DynamicPtrV4 { .. }
-                | RecordData::DynamicPtrV6 { .. }
-        )
-    }
-
     pub fn requires_ipv4(&self) -> bool {
         matches!(
             self,
@@ -498,14 +488,6 @@ impl RecordData {
             self,
             RecordData::DynamicIpv6 | RecordData::DynamicPtrV6 { .. }
         ) || matches!(self, RecordData::Text { value, .. } if value.contains("{ipv6}"))
-    }
-
-    /// Check if this record type needs dynamic IP substitution in its value
-    pub fn needs_ip_substitution(&self) -> bool {
-        match self {
-            RecordData::Text { value, .. } => value.contains("{ipv4}") || value.contains("{ipv6}"),
-            _ => false,
-        }
     }
 
     /// Generate the reverse DNS domain for an IP address
@@ -538,14 +520,14 @@ impl RecordData {
 #[serde(rename_all = "UPPERCASE")]
 pub enum DnsRecordType {
     A,
-    AAAA,
+    Aaaa,
 }
 
 impl DnsRecordType {
     pub fn as_str(&self) -> &'static str {
         match self {
             DnsRecordType::A => "A",
-            DnsRecordType::AAAA => "AAAA",
+            DnsRecordType::Aaaa => "AAAA",
         }
     }
 }
@@ -555,9 +537,6 @@ impl fmt::Display for DnsRecordType {
         f.write_str(self.as_str())
     }
 }
-
-// Legacy type alias for backwards compatibility during transition
-pub type RecordType = DnsRecordType;
 
 fn default_glesys_ttl() -> u32 {
     300

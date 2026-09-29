@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::{DnsProvider, GlesysProvider, GlesysRecord};
 use crate::ip::ResolvedIps;
@@ -164,56 +164,14 @@ impl GlesysProvider {
     ) -> Result<Vec<GlesysListedRecord>> {
         let mut aggregated = Vec::new();
         for domain in domains {
-            let payload = json!({ "domainname": domain });
-
-            debug!(
-                endpoint = %self.list_endpoint,
-                domain,
-                ?payload,
-                "Sending GleSYS listrecords request"
-            );
-
-            let response = client
-                .post(&self.list_endpoint)
-                .basic_auth(&self.api_user, Some(&self.api_key))
-                .json(&payload)
-                .send()
-                .with_context(|| {
-                    format!("failed to send listrecords request for domain {domain}")
-                })?;
-
-            let status = response.status();
-            let body = response
-                .text()
-                .context("failed to read response from GleSYS listrecords API")?;
-
-            debug!(
-                endpoint = %self.list_endpoint,
-                domain,
-                status = %status,
-                body = %body,
-                "Received GleSYS listrecords response"
-            );
-
-            ensure!(
-                status.is_success(),
-                "GleSYS listrecords error ({}): {}",
-                status,
-                body
-            );
-
-            let parsed: GlesysListResponse = serde_json::from_str(&body)
-                .context("failed to parse GleSYS listrecords response as JSON")?;
-
-            debug!(
-                domain,
-                count = parsed.response.records.len(),
-                "Parsed GleSYS listrecords payload"
-            );
-
-            aggregated.extend(parsed.response.records.into_iter());
+            let parsed: GlesysListResponse = self.request(
+                client,
+                reqwest::Method::POST,
+                &self.list_endpoint,
+                Some(json!({"domainname": domain})),
+            )?;
+            aggregated.extend(parsed.response.records);
         }
-
         Ok(aggregated)
     }
 
@@ -240,89 +198,12 @@ impl GlesysProvider {
             let record = &self.records[index];
             let mut results = Vec::new();
             let outcome = (|| -> Result<bool> {
-                use crate::config::RecordData;
-
-                // Determine the data value and handle PTR records specially
-                let (data, ptr_info) = match &record.data {
-                    RecordData::DynamicIpv4 => {
-                        let Some(ip) = ips.ipv4 else {
-                            warn!(
-                                record_id = record.record_id.as_deref(),
-                                fqdn = %record.fqdn(),
-                                "Skipping dynamic-ipv4 record; no resolved IPv4"
-                            );
-                            return Ok(false);
-                        };
-                        (ip.to_string(), None)
-                    }
-                    RecordData::DynamicIpv6 => {
-                        let Some(ip) = ips.ipv6 else {
-                            warn!(
-                                record_id = record.record_id.as_deref(),
-                                fqdn = %record.fqdn(),
-                                "Skipping dynamic-ipv6 record; no resolved IPv6"
-                            );
-                            return Ok(false);
-                        };
-                        (ip.to_string(), None)
-                    }
-                    RecordData::DynamicPtrV4 { value } => {
-                        let Some(ip) = ips.ipv4 else {
-                            warn!(
-                                record_id = record.record_id.as_deref(),
-                                hostname = %record.hostname,
-                                "Skipping dynamic-ptr-v4 record; no resolved IPv4"
-                            );
-                            return Ok(false);
-                        };
-                        (value.clone(), Some((IpAddr::V4(ip), value.clone())))
-                    }
-                    RecordData::DynamicPtrV6 { value } => {
-                        let Some(ip) = ips.ipv6 else {
-                            warn!(
-                                record_id = record.record_id.as_deref(),
-                                hostname = %record.hostname,
-                                "Skipping dynamic-ptr-v6 record; no resolved IPv6"
-                            );
-                            return Ok(false);
-                        };
-                        (value.clone(), Some((IpAddr::V6(ip), value.clone())))
-                    }
-                    RecordData::Text { value, .. } => {
-                        // Check if the text value needs IP substitution
-                        let mut substituted = value.clone();
-                        if value.contains("{ipv4}") {
-                            if let Some(ip) = ips.ipv4 {
-                                substituted = substituted.replace("{ipv4}", &ip.to_string());
-                            } else {
-                                warn!(
-                                    record_id = record.record_id.as_deref(),
-                                    fqdn = %record.fqdn(),
-                                    "Text record contains {{ipv4}} but no IPv4 resolved; skipping"
-                                );
-                                return Ok(false);
-                            }
-                        }
-                        if value.contains("{ipv6}") {
-                            if let Some(ip) = ips.ipv6 {
-                                substituted = substituted.replace("{ipv6}", &ip.to_string());
-                            } else {
-                                warn!(
-                                    record_id = record.record_id.as_deref(),
-                                    fqdn = %record.fqdn(),
-                                    "Text record contains {{ipv6}} but no IPv6 resolved; skipping"
-                                );
-                                return Ok(false);
-                            }
-                        }
-                        (substituted, None)
-                    }
-                    RecordData::Static { address, .. } => (address.to_string(), None),
+                let Some(desired) = crate::desired::resolve(&record.data, ips) else {
+                    return Ok(false);
                 };
-
-                // For PTR records, we need to handle them differently
-                if let Some((ip, hostname)) = ptr_info {
-                    self.handle_ptr_record(client, record, ip, &hostname, &mut results)?;
+                let data = desired.value;
+                if let Some(ip) = desired.ptr_ip {
+                    self.handle_ptr_record(client, record, ip, &data, &mut results)?;
                     return Ok(true);
                 }
 
@@ -393,6 +274,39 @@ impl GlesysProvider {
         report
     }
 
+    fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        client: &reqwest::blocking::Client,
+        method: reqwest::Method,
+        endpoint: &str,
+        payload: Option<Value>,
+    ) -> Result<T> {
+        debug!(%endpoint, %method, "Sending GleSYS request");
+        let mut request = client
+            .request(method, endpoint)
+            .basic_auth(&self.api_user, Some(&self.api_key));
+        if let Some(payload) = payload {
+            request = request.json(&payload);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("failed to call {endpoint}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .with_context(|| format!("failed to read {endpoint}"))?;
+        ensure!(
+            status.is_success(),
+            "GleSYS API error at {endpoint} ({status}): {body}"
+        );
+        serde_json::from_str(if body.trim().is_empty() {
+            "null"
+        } else {
+            &body
+        })
+        .with_context(|| format!("invalid JSON response from {endpoint}"))
+    }
+
     fn update_record(
         &self,
         client: &reqwest::blocking::Client,
@@ -400,52 +314,9 @@ impl GlesysProvider {
         record: &GlesysRecord,
         data: &str,
     ) -> Result<()> {
-        let payload = json!({
-            "recordid": record_id,
-            "host": record.hostname,
-            "type": record.data.dns_record_type(),
-            "ttl": record.ttl,
-            "data": data,
-        });
-
-        debug!(
-            endpoint = %self.update_endpoint,
-            record_id = %record_id,
-            fqdn = %record.fqdn(),
-            record_type = %record.data.dns_record_type(),
-            ttl = record.ttl,
-            data = %data,
-            ?payload,
-            "Sending GleSYS update request"
-        );
-
-        let response = client
-            .post(&self.update_endpoint)
-            .basic_auth(&self.api_user, Some(&self.api_key))
-            .json(&payload)
-            .send()
-            .context("failed to send request to GleSYS API")?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .context("failed to read response from GleSYS API")?;
-
-        debug!(
-            endpoint = %self.update_endpoint,
-            record_id = %record_id,
-            status = %status,
-            body = %body,
-            "Received GleSYS update response"
-        );
-
-        ensure!(
-            status.is_success(),
-            "GleSYS API error ({}): {}",
-            status,
-            body
-        );
-
+        let _: Value = self.request(client, reqwest::Method::POST, &self.update_endpoint, Some(json!({
+            "recordid": record_id, "host": record.hostname, "type": record.data.dns_record_type(), "ttl": record.ttl, "data": data,
+        })))?;
         Ok(())
     }
 
@@ -455,112 +326,25 @@ impl GlesysProvider {
         record: &GlesysRecord,
         data: &str,
     ) -> Result<String> {
-        let payload = json!({
-            "domainname": record.domain,
-            "host": record.hostname,
-            "type": record.data.dns_record_type(),
-            "ttl": record.ttl,
-            "data": data,
-        });
-
-        debug!(
-            endpoint = %self.add_endpoint,
-            fqdn = %record.fqdn(),
-            record_type = %record.data.dns_record_type(),
-            ttl = record.ttl,
-            data = %data,
-            ?payload,
-            "Sending GleSYS addrecord request"
-        );
-
-        let response = client
-            .post(&self.add_endpoint)
-            .basic_auth(&self.api_user, Some(&self.api_key))
-            .json(&payload)
-            .send()
-            .context("failed to send request to GleSYS addrecord API")?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .context("failed to read response from GleSYS addrecord API")?;
-
-        debug!(
-            endpoint = %self.add_endpoint,
-            status = %status,
-            body = %body,
-            "Received GleSYS addrecord response"
-        );
-
-        ensure!(
-            status.is_success(),
-            "GleSYS addrecord error ({}): {}",
-            status,
-            body
-        );
-
-        let parsed: GlesysAddResponse = serde_json::from_str(&body)
-            .context("failed to parse GleSYS addrecord response as JSON")?;
-
+        let parsed: GlesysAddResponse = self.request(client, reqwest::Method::POST, &self.add_endpoint, Some(json!({
+            "domainname": record.domain, "host": record.hostname, "type": record.data.dns_record_type(), "ttl": record.ttl, "data": data,
+        })))?;
         Ok(parsed.response.record.record_id)
     }
 
     fn delete_record(&self, client: &reqwest::blocking::Client, record_id: &str) -> Result<()> {
-        let payload = json!({
-            "recordid": record_id,
-        });
-
-        debug!(
-            endpoint = %self.delete_endpoint,
-            record_id = %record_id,
-            ?payload,
-            "Sending GleSYS deleterecord request"
-        );
-
-        let response = client
-            .post(&self.delete_endpoint)
-            .basic_auth(&self.api_user, Some(&self.api_key))
-            .json(&payload)
-            .send()
-            .context("failed to send request to GleSYS deleterecord API")?;
-
-        let status = response.status();
-        let body = response
-            .text()
-            .context("failed to read response from GleSYS deleterecord API")?;
-
-        debug!(
-            endpoint = %self.delete_endpoint,
-            record_id = %record_id,
-            status = %status,
-            body = %body,
-            "Received GleSYS deleterecord response"
-        );
-
-        ensure!(
-            status.is_success(),
-            "GleSYS deleterecord error ({}): {}",
-            status,
-            body
-        );
-
+        let _: Value = self.request(
+            client,
+            reqwest::Method::POST,
+            &self.delete_endpoint,
+            Some(json!({"recordid": record_id})),
+        )?;
         Ok(())
     }
 
     pub fn list_domains(&self, client: &reqwest::blocking::Client) -> Result<Vec<String>> {
-        let response = client
-            .get(&self.domains_endpoint)
-            .basic_auth(&self.api_user, Some(&self.api_key))
-            .send()
-            .context("failed to list GleSYS zones")?;
-        let status = response.status();
-        let body = response.text()?;
-        ensure!(
-            status.is_success(),
-            "GleSYS list zones error ({status}): {body}"
-        );
         let parsed: GlesysDomainsResponse =
-            serde_json::from_str(&body).context("invalid GleSYS zone list")?;
+            self.request(client, reqwest::Method::GET, &self.domains_endpoint, None)?;
         Ok(parsed
             .response
             .domains

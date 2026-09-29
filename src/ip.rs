@@ -2,21 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{IpSource, IpSources, RecordType};
+use crate::config::{IpSource, IpSources};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIps {
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
-}
-
-impl ResolvedIps {
-    pub fn ip_for(&self, record_type: RecordType) -> Option<IpAddr> {
-        match record_type {
-            RecordType::A => self.ipv4.map(IpAddr::V4),
-            RecordType::AAAA => self.ipv6.map(IpAddr::V6),
-        }
-    }
 }
 
 pub struct ResolveReport {
