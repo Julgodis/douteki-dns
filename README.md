@@ -43,7 +43,7 @@ docker run --rm \
   --config /app/config.toml ddns
 ```
 
-The updater checks for address changes continuously. It applies the configured record values at startup and again when a resolved IP address changes. Set `check_interval_seconds` to control polling; by default, the interval is derived from the lowest configured record TTL.
+The updater applies records at startup. Dynamic records and text records with IP placeholders are checked on their own schedules and updated when their required address changes. `interval_seconds` overrides the global `check_interval_seconds` for a record; the global default is derived from the lowest configured TTL. Static records without an explicit interval are applied once per process; those with an interval are reconciled periodically. Failed records retry on their own interval without rewriting successful records.
 
 ## Configuration files and shared record settings
 

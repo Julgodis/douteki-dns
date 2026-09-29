@@ -1,13 +1,14 @@
 mod config;
 mod ip;
 mod provider;
+mod scheduler;
 mod state;
 #[cfg(test)]
 mod test_support;
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -69,7 +70,6 @@ fn build_client(config: &config::Config) -> Result<reqwest::blocking::Client> {
 
 fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Result<()> {
     let interval_secs = determine_interval_seconds(config);
-    let interval = Duration::from_secs(interval_secs);
 
     if let Some(min_ttl) = config.provider.min_ttl() {
         info!(
@@ -86,53 +86,34 @@ fn run_ddns(config: &config::Config, client: &reqwest::blocking::Client) -> Resu
         );
     }
 
-    let mut previous_ips: Option<ip::ResolvedIps> = None;
-
+    let mut scheduler = scheduler::Scheduler::new(config.provider.records(), interval_secs);
+    let started = Instant::now();
     loop {
+        let due = scheduler.due(started.elapsed());
+        let (ipv4, ipv6) = scheduler.required_ips(&due);
         let ip::ResolveReport {
             ips: resolved,
             errors,
-        } = ip::resolve_required(
-            &config.ip_sources,
-            client,
-            config
-                .provider
-                .records()
-                .iter()
-                .any(|r| r.data.requires_ipv4()),
-            config
-                .provider
-                .records()
-                .iter()
-                .any(|r| r.data.requires_ipv6()),
-        );
-
-        for error in &errors {
+        } = ip::resolve_required(&config.ip_sources, client, ipv4, ipv6);
+        for error in errors {
             warn!(error = %error, "Failed to determine current IP address");
         }
-
-        debug!(?resolved, "Resolved IP addresses");
-
-        let changed = previous_ips.as_ref() != Some(&resolved);
-
-        if changed {
-            let report = config.provider.update(client, &resolved);
-            for update in report.updates {
-                info!(fqdn = update.fqdn, record_type = %update.record_type,
-                    data = %update.data, outcome = update.outcome.as_str(),
-                    record_id = update.record_id.as_deref(), "DNS record change applied");
-            }
-            for (index, error) in &report.errors {
-                warn!(record = index, error = %error, "Failed to push DNS update");
-            }
-            if report.errors.is_empty() {
-                previous_ips = Some(resolved);
-            }
-        } else {
-            debug!(interval = interval_secs, "No IP change detected");
+        let selected: Vec<_> = due
+            .iter()
+            .copied()
+            .filter(|i| scheduler.needs_update(*i, &resolved))
+            .collect();
+        let report = config.provider.update(client, &resolved, &selected);
+        for update in report.updates {
+            info!(fqdn = update.fqdn, record_type = %update.record_type,
+                data = %update.data, outcome = update.outcome.as_str(),
+                record_id = update.record_id.as_deref(), "DNS record change applied");
         }
-
-        thread::sleep(interval);
+        for (index, error) in &report.errors {
+            warn!(record = index, error = %error, "Failed to push DNS update");
+        }
+        scheduler.finish(&due, &report.applied, &resolved, started.elapsed());
+        thread::sleep(scheduler.delay(started.elapsed()));
     }
 }
 

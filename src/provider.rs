@@ -129,9 +129,14 @@ impl RecordUpdate {
 }
 
 impl DnsProvider {
-    pub fn update(&self, client: &reqwest::blocking::Client, ips: &ResolvedIps) -> UpdateReport {
+    pub fn update(
+        &self,
+        client: &reqwest::blocking::Client,
+        ips: &ResolvedIps,
+        selected: &[usize],
+    ) -> UpdateReport {
         match self {
-            DnsProvider::Glesys(config) => config.update(client, ips),
+            DnsProvider::Glesys(config) => config.update_selected(client, ips, selected),
         }
     }
 }
@@ -204,7 +209,17 @@ impl GlesysProvider {
         Ok(aggregated)
     }
 
+    #[cfg(test)]
     fn update(&self, client: &reqwest::blocking::Client, ips: &ResolvedIps) -> UpdateReport {
+        self.update_selected(client, ips, &(0..self.records.len()).collect::<Vec<_>>())
+    }
+
+    fn update_selected(
+        &self,
+        client: &reqwest::blocking::Client,
+        ips: &ResolvedIps,
+        selected: &[usize],
+    ) -> UpdateReport {
         let mut report = UpdateReport::default();
         let mut existing: HashMap<String, Result<Vec<GlesysListedRecord>>> = HashMap::new();
         let mut claimed: HashSet<String> = self
@@ -213,7 +228,8 @@ impl GlesysProvider {
             .filter_map(|r| r.record_id.clone())
             .collect();
 
-        for (index, record) in self.records.iter().enumerate() {
+        for &index in selected {
+            let record = &self.records[index];
             let mut results = Vec::new();
             let outcome = (|| -> Result<bool> {
                 use crate::config::RecordData;
