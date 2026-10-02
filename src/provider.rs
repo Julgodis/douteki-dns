@@ -249,7 +249,8 @@ impl GlesysProvider {
                         unavailable.insert(matched.record_id.clone());
                     }
                 }
-                let record_id = select_record(record, &data, &candidates, &unavailable, shared_key)?;
+                let record_id =
+                    select_record(record, &data, &candidates, &unavailable, shared_key)?;
 
                 match record_id {
                     Some(ref record_id) => {
