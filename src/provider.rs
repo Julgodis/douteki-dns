@@ -225,7 +225,32 @@ impl GlesysProvider {
                     .filter(|r| RecordKey::from_listed(r) == key)
                     .cloned()
                     .collect();
-                let record_id = select_record(record, &data, &candidates, &claimed, shared_key)?;
+                // Siblings may already have succeeded, or may not be due this cycle.
+                // Reserve their unique value matches before deciding whether this entry
+                // is missing. Unknown or ambiguous records must remain candidates.
+                let mut unavailable = claimed.clone();
+                for (sibling_index, sibling) in self.records.iter().enumerate() {
+                    if sibling_index == index
+                        || sibling.record_id.is_some()
+                        || RecordKey::from_config(sibling) != key
+                    {
+                        continue;
+                    }
+                    let Some(sibling_data) = crate::desired::resolve(&sibling.data, ips) else {
+                        continue;
+                    };
+                    if sibling_data.ptr_ip.is_some() || sibling_data.value == data {
+                        continue;
+                    }
+                    let mut matches = candidates.iter().filter(|r| r.data == sibling_data.value);
+                    if let Some(matched) = matches.next()
+                        && matches.next().is_none()
+                    {
+                        unavailable.insert(matched.record_id.clone());
+                    }
+                }
+                let record_id =
+                    select_record(record, &data, &candidates, &unavailable, shared_key)?;
 
                 match record_id {
                     Some(ref record_id) => {
@@ -624,6 +649,89 @@ value="one"
             select_record(&txt(), "one", &[], &claimed, true).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn shared_record_recovery_refuses_unknown_or_ambiguous_siblings() {
+        for (mut rows, sibling_kind) in [
+            (
+                vec![listed("2", "two"), listed("3", "unmanaged")],
+                "implicit",
+            ),
+            (vec![listed("2", "two"), listed("3", "two")], "implicit"),
+            (vec![listed("2", "old"), listed("3", "two")], "explicit"),
+            (vec![listed("2", "two")], "dynamic-ptr"),
+        ] {
+            if sibling_kind == "dynamic-ptr" {
+                for row in &mut rows {
+                    row.record_type = "PTR".into();
+                }
+            }
+            let rows: Vec<_> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "recordid": r.record_id,
+                        "domainname": r.domain,
+                        "host": r.host,
+                        "type": r.record_type,
+                        "data": r.data,
+                        "ttl": r.ttl,
+                    })
+                })
+                .collect();
+            let api = crate::test_support::MockApi::new(vec![(
+                200,
+                json!({"response":{"records":rows}}),
+            )]);
+            let mut provider: GlesysProvider = toml::from_str(&format!(
+                r#"
+api_user="test"
+api_key="test"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+update_endpoint="{0}/update"
+[[records]]
+domain="example.com"
+hostname="@"
+type="text"
+record_type="TXT"
+value="one"
+[[records]]
+domain="example.com"
+hostname="@"
+type="text"
+record_type="TXT"
+value="two"
+"#,
+                api.url
+            ))
+            .unwrap();
+            if sibling_kind == "explicit" {
+                provider.records[1].record_id = Some("2".into());
+            } else if sibling_kind == "dynamic-ptr" {
+                provider.records[0].data = crate::config::RecordData::Text {
+                    record_type: "PTR".into(),
+                    value: "one".into(),
+                };
+                provider.records[1].data = crate::config::RecordData::DynamicPtrV4 {
+                    value: "two".into(),
+                };
+            }
+            let report = provider.update_selected(
+                &reqwest::blocking::Client::new(),
+                &ResolvedIps {
+                    ipv4: Some("192.0.2.1".parse().unwrap()),
+                    ipv6: None,
+                },
+                &[0],
+            );
+            assert!(report.applied.is_empty());
+            assert!(report.updates.is_empty());
+            assert_eq!(report.errors.len(), 1);
+            assert!(report.errors[0].1.contains("ambiguous records"));
+            assert_eq!(api.requests().len(), 1);
+        }
     }
 
     fn ptr_provider(api: &crate::test_support::MockApi, state: &std::path::Path) -> GlesysProvider {
