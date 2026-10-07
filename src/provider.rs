@@ -397,13 +397,23 @@ impl GlesysProvider {
             desired.record_id = Some(id.clone());
         }
         let id = select_record(&desired, hostname, &candidates, &HashSet::new(), false)?;
-        // Save intent before creating: a restart can rediscover an interrupted successful add.
+        // Preserve the observed value as well as update intent: an error may mean the
+        // request failed before applying, or that only its successful response was lost.
+        // New records still save their creation intent before contacting the provider.
         let mut owned = OwnedPtr {
             domain,
             host,
-            data: hostname.into(),
+            data: candidates
+                .iter()
+                .find(|r| Some(&r.record_id) == id.as_ref())
+                .map(|r| r.data.clone())
+                .unwrap_or_else(|| hostname.into()),
+            pending_data: None,
             id: id.clone(),
         };
+        if owned.data != hostname {
+            owned.pending_data = Some(hostname.into());
+        }
         let mut pending = previous.clone();
         pending.retain(|r| !(r.domain == owned.domain && r.host == owned.host));
         pending.push(owned.clone());
@@ -419,6 +429,8 @@ impl GlesysProvider {
                 RecordUpdate::created(&desired, hostname.into(), Some(id))
             }
         };
+        owned.data = hostname.into();
+        owned.pending_data = None;
         owned.id = update.record_id.clone();
         let pending = journal.records.get_mut(&identity).unwrap();
         *pending.last_mut().unwrap() = owned.clone();
@@ -449,7 +461,8 @@ impl GlesysProvider {
                     existing.domain == old.domain
                         && existing.host == old.host
                         && existing.record_type == "PTR"
-                        && existing.data == old.data,
+                        && (existing.data == old.data
+                            || old.pending_data.as_deref() == Some(existing.data.as_str())),
                     "previous PTR was changed externally; refusing to delete {}",
                     existing.record_id
                 );
@@ -884,6 +897,225 @@ address="192.0.2.5"
                 .count(),
             2
         );
+    }
+
+    fn check_interrupted_ptr_target_rename(
+        update_response: (u16, Value),
+        remote_target: &str,
+        cleanup_expected: bool,
+    ) {
+        let domains = json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}});
+        let old = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":"home.example.com","ttl":300});
+        let after_attempt = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":remote_target,"ttl":300});
+        let mut responses = vec![
+            (200, domains.clone()),
+            (200, json!({"response":{"records":[old.clone()]}})),
+            (200, json!({})),
+            (200, domains.clone()),
+            (200, json!({"response":{"records":[old]}})),
+            update_response,
+            (200, domains),
+            (200, json!({"response":{"records":[after_attempt.clone()]}})),
+            (200, json!({"response":{"record":{"recordid":"2"}}})),
+            (200, json!({"response":{"records":[after_attempt]}})),
+        ];
+        if cleanup_expected {
+            responses.push((200, json!({})));
+        }
+        let api = crate::test_support::MockApi::new(responses);
+        let dir = crate::test_support::TempDir::new();
+        let state = dir.path().join("state.json");
+        let client = reqwest::blocking::Client::new();
+        let first = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        assert!(
+            ptr_provider(&api, &state)
+                .update(&client, &first)
+                .errors
+                .is_empty()
+        );
+        let renamed_provider = || {
+            let mut provider = ptr_provider(&api, &state);
+            provider.records[0].data = crate::config::RecordData::DynamicPtrV4 {
+                value: "new.example.com".into(),
+            };
+            provider
+        };
+        assert_eq!(renamed_provider().update(&client, &first).errors.len(), 1);
+        {
+            let journal = crate::state::PtrJournal::open(&state).unwrap();
+            let owned = &journal.records.values().next().unwrap()[0];
+            assert_eq!(owned.data, "home.example.com");
+            assert_eq!(owned.pending_data.as_deref(), Some("new.example.com"));
+        }
+        // Construct a fresh provider to exercise the durable state after a restart.
+        let second = ResolvedIps {
+            ipv4: Some("192.0.2.2".parse().unwrap()),
+            ipv6: None,
+        };
+        let migrated = renamed_provider().update(&client, &second);
+        let requests = api.requests();
+        let deletes: Vec<_> = requests
+            .iter()
+            .filter(|(path, _)| path == "/delete")
+            .collect();
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        let owned = journal.records.values().next().unwrap();
+        if cleanup_expected {
+            assert!(migrated.errors.is_empty(), "{:?}", migrated.errors);
+            assert_eq!(migrated.applied, [0]);
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(deletes[0].1["recordid"], "1");
+            assert_eq!(owned.len(), 1);
+            assert_eq!(owned[0].id.as_deref(), Some("2"));
+            assert_eq!(owned[0].data, "new.example.com");
+            assert!(owned[0].pending_data.is_none());
+        } else {
+            assert_eq!(migrated.errors.len(), 1);
+            assert!(migrated.errors[0].1.contains("changed externally"));
+            assert!(deletes.is_empty());
+            assert_eq!(owned.len(), 2);
+        }
+    }
+
+    #[test]
+    fn failed_ptr_target_rename_then_ip_migration_cleans_original_record() {
+        check_interrupted_ptr_target_rename(
+            (503, json!({"error":"update failed"})),
+            "home.example.com",
+            true,
+        );
+    }
+
+    #[test]
+    fn interrupted_successful_ptr_target_rename_then_ip_migration_cleans_updated_record() {
+        // The remote update took effect, but its response body was truncated.
+        check_interrupted_ptr_target_rename((200, json!("{")), "new.example.com", true);
+    }
+
+    #[test]
+    fn external_change_after_interrupted_ptr_target_rename_is_not_deleted() {
+        check_interrupted_ptr_target_rename(
+            (503, json!({"error":"update failed"})),
+            "unrelated.example.com",
+            false,
+        );
+    }
+
+    fn check_same_ip_ptr_target_rename(retry: bool) {
+        let domains = json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}});
+        let old = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":"home.example.com","ttl":300});
+        let mut responses = vec![
+            (200, domains.clone()),
+            (200, json!({"response":{"records":[old.clone()]}})),
+            (200, json!({})),
+        ];
+        if retry {
+            responses.extend([
+                (200, domains.clone()),
+                (200, json!({"response":{"records":[old.clone()]}})),
+                (503, json!({"error":"update failed"})),
+            ]);
+        }
+        responses.extend([
+            (200, domains),
+            (200, json!({"response":{"records":[old]}})),
+            (200, json!({})),
+        ]);
+        let api = crate::test_support::MockApi::new(responses);
+        let dir = crate::test_support::TempDir::new();
+        let state = dir.path().join("state.json");
+        let client = reqwest::blocking::Client::new();
+        let ips = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        let mut provider = ptr_provider(&api, &state);
+        assert!(provider.update(&client, &ips).errors.is_empty());
+        provider.records[0].data = crate::config::RecordData::DynamicPtrV4 {
+            value: "new.example.com".into(),
+        };
+        if retry {
+            assert_eq!(provider.update(&client, &ips).errors.len(), 1);
+        }
+        let report = provider.update(&client, &ips);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.applied, [0]);
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        let owned = journal.records.values().next().unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].id.as_deref(), Some("1"));
+        assert_eq!(owned[0].data, "new.example.com");
+        assert!(owned[0].pending_data.is_none());
+        let requests = api.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|(path, _)| path != "/delete" && path != "/add")
+        );
+        assert_eq!(requests.last().unwrap().1["data"], "new.example.com");
+    }
+
+    #[test]
+    fn successful_ptr_target_rename_commits_confirmed_data() {
+        check_same_ip_ptr_target_rename(false);
+    }
+
+    #[test]
+    fn failed_ptr_target_rename_retries_at_the_same_ip() {
+        check_same_ip_ptr_target_rename(true);
+    }
+
+    #[test]
+    fn interrupted_ptr_creation_then_ip_migration_cleans_rediscovered_record() {
+        let domains = json!({"response":{"domains":[{"domainname":"2.0.192.in-addr.arpa"}]}});
+        let old = json!({"recordid":"1","domainname":"2.0.192.in-addr.arpa","host":"1","type":"PTR","data":"home.example.com","ttl":300});
+        let api = crate::test_support::MockApi::new(vec![
+            (200, domains.clone()),
+            (200, json!({"response":{"records":[]}})),
+            // Creation took effect remotely, but no usable ID reached the updater.
+            (200, json!("{")),
+            (200, domains),
+            (200, json!({"response":{"records":[old.clone()]}})),
+            (200, json!({"response":{"record":{"recordid":"2"}}})),
+            (200, json!({"response":{"records":[old]}})),
+            (200, json!({})),
+        ]);
+        let dir = crate::test_support::TempDir::new();
+        let state = dir.path().join("state.json");
+        let client = reqwest::blocking::Client::new();
+        let first = ResolvedIps {
+            ipv4: Some("192.0.2.1".parse().unwrap()),
+            ipv6: None,
+        };
+        assert_eq!(
+            ptr_provider(&api, &state)
+                .update(&client, &first)
+                .errors
+                .len(),
+            1
+        );
+        {
+            let journal = crate::state::PtrJournal::open(&state).unwrap();
+            let owned = &journal.records.values().next().unwrap()[0];
+            assert!(owned.id.is_none());
+            assert!(owned.pending_data.is_none());
+        }
+        let second = ResolvedIps {
+            ipv4: Some("192.0.2.2".parse().unwrap()),
+            ipv6: None,
+        };
+        let migrated = ptr_provider(&api, &state).update(&client, &second);
+        assert!(migrated.errors.is_empty(), "{:?}", migrated.errors);
+        let requests = api.requests();
+        assert_eq!(requests.last().unwrap().0, "/delete");
+        assert_eq!(requests.last().unwrap().1["recordid"], "1");
+        let journal = crate::state::PtrJournal::open(&state).unwrap();
+        let owned = journal.records.values().next().unwrap();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].id.as_deref(), Some("2"));
     }
 
     #[test]

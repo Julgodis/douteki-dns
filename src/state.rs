@@ -12,6 +12,9 @@ pub struct OwnedPtr {
     pub domain: String,
     pub host: String,
     pub data: String,
+    /// A requested replacement that may have reached the provider without a usable response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_data: Option<String>,
     pub id: Option<String>,
 }
 
@@ -84,6 +87,7 @@ mod tests {
                 domain: "2.0.192.in-addr.arpa".into(),
                 host: "1".into(),
                 data: "home.example.com".into(),
+                pending_data: Some("new.example.com".into()),
                 id: Some("1".into()),
             }],
         );
@@ -93,5 +97,23 @@ mod tests {
         assert_eq!(PtrJournal::open(&path).unwrap().records, expected);
         fs::write(&path, "corrupt state").unwrap();
         assert!(PtrJournal::open(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_journal_without_pending_data_remains_readable() {
+        let dir = crate::test_support::TempDir::new();
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{"entry":[{"domain":"2.0.192.in-addr.arpa","host":"1","data":"home.example.com","id":"1"}]}"#,
+        )
+        .unwrap();
+        let journal = PtrJournal::open(&path).unwrap();
+        let owned = &journal.records["entry"][0];
+        assert_eq!(owned.data, "home.example.com");
+        assert_eq!(owned.id.as_deref(), Some("1"));
+        assert!(owned.pending_data.is_none());
+        journal.save().unwrap();
+        assert!(!fs::read_to_string(&path).unwrap().contains("pending_data"));
     }
 }
