@@ -117,6 +117,56 @@ value="two"
     }
 
     #[test]
+    fn failed_shared_txt_creation_retries_without_rewriting_successful_sibling() {
+        let api = MockApi::new(vec![
+            (200, json!({"response":{"records":[]}})),
+            (503, json!({"error":"retry"})),
+            (200, json!({"response":{"record":{"recordid":"2"}}})),
+            (
+                200,
+                json!({"response":{"records":[{"recordid":"2","domainname":"example.com","host":"@","type":"TXT","ttl":300,"data":"two"}]}}),
+            ),
+            (200, json!({"response":{"record":{"recordid":"1"}}})),
+        ]);
+        let dir = TempDir::new();
+        let cfg = config(
+            &api,
+            &dir,
+            "type=\"static\"\naddress=\"192.0.2.1\"",
+            r#"
+[[provider.records]]
+domain="example.com"
+hostname="@"
+type="text"
+record_type="TXT"
+value="one"
+[[provider.records]]
+domain="example.com"
+hostname="@"
+type="text"
+record_type="TXT"
+value="two"
+"#,
+        );
+        let mut scheduler = Scheduler::new(cfg.provider.records(), 1);
+        let first = tick(&cfg, &mut scheduler, 0).updates;
+        assert_eq!(first.errors.len(), 1);
+        assert_eq!(first.applied, [1]);
+        let retried = tick(&cfg, &mut scheduler, 1).updates;
+        assert!(retried.errors.is_empty(), "{:?}", retried.errors);
+        assert_eq!(retried.applied, [0]);
+        assert!(tick(&cfg, &mut scheduler, 2).updates.updates.is_empty());
+        let requests = api.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[4].0, "/add");
+        assert_eq!(requests[4].1["data"], "one");
+        assert_eq!(
+            requests.iter().filter(|(_, p)| p["data"] == "two").count(),
+            1
+        );
+    }
+
+    #[test]
     fn source_outage_applies_static_then_recovers_dynamic_without_rewriting_static() {
         let api = MockApi::new(vec![
             (503, json!({"error":"offline"})),
