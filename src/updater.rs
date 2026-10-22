@@ -82,8 +82,6 @@ ptr_state_file={1}
             (200, json!({"response":{"record":{"recordid":"1"}}})),
             (200, json!({"response":{"record":{"recordid":"2"}}})),
             (200, rows),
-            (200, json!({})),
-            (200, json!({})),
         ]);
         let dir = TempDir::new();
         let cfg = config(
@@ -110,10 +108,13 @@ value="two"
         assert!(tick(&cfg, &mut scheduler, 1).updates.updates.is_empty());
         assert_eq!(api.requests().len(), 3);
         let mut restarted = Scheduler::new(cfg.provider.records(), 1);
-        assert_eq!(tick(&cfg, &mut restarted, 0).updates.applied, [0, 1]);
+        let report = tick(&cfg, &mut restarted, 0).updates;
+        assert_eq!(report.applied, [0, 1]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.updates.is_empty());
         let requests = api.requests();
-        assert_eq!(requests[4].1["recordid"], "1");
-        assert_eq!(requests[5].1["recordid"], "2");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[3].0, "/list");
     }
 
     #[test]
