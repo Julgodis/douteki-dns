@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -48,6 +48,8 @@ struct RecordKey {
     record_type: String,
 }
 
+type RecordSets = HashMap<RecordKey, Vec<GlesysListedRecord>>;
+
 impl RecordKey {
     fn from_config(record: &GlesysRecord) -> Self {
         Self {
@@ -66,12 +68,28 @@ impl RecordKey {
     }
 }
 
+fn record_data_matches(record_type: &str, left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match record_type {
+        "A" => left
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|address| right.parse::<Ipv4Addr>() == Ok(address)),
+        "AAAA" => left
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|address| right.parse::<Ipv6Addr>() == Ok(address)),
+        _ => false,
+    }
+}
+
 // Never guess which member of a record set the user intends to manage.
 fn select_record(
     record: &GlesysRecord,
     data: &str,
     existing: &[GlesysListedRecord],
     claimed: &HashSet<String>,
+    reserved: &HashSet<String>,
     shared_key: bool,
 ) -> Result<Option<String>> {
     if let Some(id) = &record.record_id {
@@ -85,9 +103,12 @@ fn select_record(
     }
     let candidates: Vec<_> = existing
         .iter()
-        .filter(|r| !claimed.contains(&r.record_id))
+        .filter(|r| !claimed.contains(&r.record_id) && !reserved.contains(&r.record_id))
         .collect();
-    let exact: Vec<_> = candidates.iter().filter(|r| r.data == data).collect();
+    let exact: Vec<_> = candidates
+        .iter()
+        .filter(|r| record_data_matches(record.data.dns_record_type(), &r.data, data))
+        .collect();
     if exact.len() == 1 {
         return Ok(Some(exact[0].record_id.clone()));
     }
@@ -187,7 +208,17 @@ impl GlesysProvider {
         selected: &[usize],
     ) -> UpdateReport {
         let mut report = UpdateReport::default();
-        let mut existing: HashMap<String, Result<Vec<GlesysListedRecord>>> = HashMap::new();
+        if selected.is_empty() {
+            return report;
+        }
+        let mut siblings_by_key: HashMap<RecordKey, Vec<usize>> = HashMap::new();
+        for (index, record) in self.records.iter().enumerate() {
+            siblings_by_key
+                .entry(RecordKey::from_config(record))
+                .or_default()
+                .push(index);
+        }
+        let mut existing: HashMap<String, Result<RecordSets>> = HashMap::new();
         let mut claimed: HashSet<String> = self
             .records
             .iter()
@@ -208,52 +239,61 @@ impl GlesysProvider {
                 }
 
                 let key = RecordKey::from_config(record);
-                let shared_key = self
-                    .records
-                    .iter()
-                    .filter(|r| RecordKey::from_config(r) == key)
-                    .count()
-                    > 1;
-                let records = existing
-                    .entry(record.domain.clone())
-                    .or_insert_with(|| self.list_domains_records(client, [record.domain.as_str()]));
+                let siblings = &siblings_by_key[&key];
+                let shared_key = siblings.len() > 1;
+                let records = existing.entry(record.domain.clone()).or_insert_with(|| {
+                    let mut grouped = RecordSets::new();
+                    for listed in self.list_domains_records(client, [record.domain.as_str()])? {
+                        grouped
+                            .entry(RecordKey::from_listed(&listed))
+                            .or_default()
+                            .push(listed);
+                    }
+                    Ok(grouped)
+                });
                 let records = records
                     .as_ref()
                     .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-                let candidates: Vec<_> = records
-                    .iter()
-                    .filter(|r| RecordKey::from_listed(r) == key)
-                    .cloned()
-                    .collect();
+                let candidates = records.get(&key).map(Vec::as_slice).unwrap_or_default();
                 // Siblings may already have succeeded, or may not be due this cycle.
                 // Reserve their unique value matches before deciding whether this entry
                 // is missing. Unknown or ambiguous records must remain candidates.
-                let mut unavailable = claimed.clone();
-                for (sibling_index, sibling) in self.records.iter().enumerate() {
-                    if sibling_index == index
-                        || sibling.record_id.is_some()
-                        || RecordKey::from_config(sibling) != key
-                    {
+                let mut reserved = HashSet::new();
+                for &sibling_index in siblings {
+                    let sibling = &self.records[sibling_index];
+                    if sibling_index == index || sibling.record_id.is_some() {
                         continue;
                     }
                     let Some(sibling_data) = crate::desired::resolve(&sibling.data, ips) else {
                         continue;
                     };
-                    if sibling_data.ptr_ip.is_some() || sibling_data.value == data {
+                    if sibling_data.ptr_ip.is_some()
+                        || record_data_matches(&key.record_type, &sibling_data.value, &data)
+                    {
                         continue;
                     }
-                    let mut matches = candidates.iter().filter(|r| r.data == sibling_data.value);
+                    let mut matches = candidates.iter().filter(|r| {
+                        record_data_matches(&key.record_type, &r.data, &sibling_data.value)
+                    });
                     if let Some(matched) = matches.next()
                         && matches.next().is_none()
                     {
-                        unavailable.insert(matched.record_id.clone());
+                        reserved.insert(matched.record_id.clone());
                     }
                 }
                 let record_id =
-                    select_record(record, &data, &candidates, &unavailable, shared_key)?;
+                    select_record(record, &data, candidates, &claimed, &reserved, shared_key)?;
 
                 match record_id {
                     Some(ref record_id) => {
+                        claimed.insert(record_id.clone());
+                        if candidates.iter().any(|r| {
+                            &r.record_id == record_id
+                                && r.ttl == record.ttl
+                                && record_data_matches(&key.record_type, &r.data, &data)
+                        }) {
+                            return Ok(true);
+                        }
                         debug!(
                             record_id = %record_id,
                             fqdn = %record.fqdn(),
@@ -262,7 +302,6 @@ impl GlesysProvider {
                             "Preparing GleSYS update"
                         );
 
-                        claimed.insert(record_id.clone());
                         self.update_record(client, record_id, record, &data)?;
 
                         results.push(RecordUpdate::updated(
@@ -421,7 +460,14 @@ impl GlesysProvider {
         {
             desired.record_id = Some(id.clone());
         }
-        let id = select_record(&desired, hostname, &candidates, &HashSet::new(), false)?;
+        let id = select_record(
+            &desired,
+            hostname,
+            &candidates,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        )?;
         // A failed update can leave either the previous target or the requested target.
         // Only trust observed data already attributable to our journal for a known ID;
         // otherwise a failed reconciliation could grant cleanup rights to an external edit.
@@ -648,33 +694,132 @@ value="one"
     #[test]
     fn record_sets_match_by_value_or_require_an_explicit_id() {
         let existing = vec![listed("1", "one"), listed("2", "two")];
+        let empty = HashSet::new();
         assert_eq!(
-            select_record(&txt(), "two", &existing, &HashSet::new(), true).unwrap(),
+            select_record(&txt(), "two", &existing, &empty, &empty, true).unwrap(),
             Some("2".into())
         );
-        assert!(select_record(&txt(), "new", &existing, &HashSet::new(), false).is_err());
+        assert!(select_record(&txt(), "new", &existing, &empty, &empty, false).is_err());
         let mut record = txt();
         record.record_id = Some("1".into());
         assert_eq!(
-            select_record(&record, "new", &existing, &HashSet::new(), true).unwrap(),
+            select_record(&record, "new", &existing, &empty, &empty, true).unwrap(),
             Some("1".into())
         );
         record.record_id = Some("unknown".into());
-        assert!(select_record(&record, "new", &existing, &HashSet::new(), true).is_err());
+        assert!(select_record(&record, "new", &existing, &empty, &empty, true).is_err());
     }
 
     #[test]
-    fn claimed_records_are_never_reused() {
+    fn claimed_and_reserved_records_are_never_reused() {
         let existing = vec![listed("1", "one")];
-        let claimed = HashSet::from(["1".into()]);
-        assert_eq!(
-            select_record(&txt(), "two", &existing, &claimed, true).unwrap(),
-            None
-        );
-        assert_eq!(
-            select_record(&txt(), "one", &[], &claimed, true).unwrap(),
-            None
-        );
+        let unavailable = HashSet::from(["1".into()]);
+        let empty = HashSet::new();
+        for (claimed, reserved) in [(&unavailable, &empty), (&empty, &unavailable)] {
+            for data in ["one", "two"] {
+                assert_eq!(
+                    select_record(&txt(), data, &existing, claimed, reserved, true).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equivalent_ipv6_addresses_match_the_right_member_of_a_record_set() {
+        for (first_present, ttl) in [(true, 300), (true, 60), (false, 300)] {
+            let mut rows = vec![
+                json!({"recordid":"2","domainname":"example.com","host":"@","type":"AAAA","ttl":300,"data":"2001:0db8:0000:0000:0000:0000:0000:0002"}),
+            ];
+            if first_present {
+                rows.push(json!({"recordid":"1","domainname":"example.com","host":"@","type":"AAAA","ttl":ttl,"data":"2001:0db8:0000:0000:0000:0000:0000:0001"}));
+            }
+            let api = crate::test_support::MockApi::new(vec![
+                (200, json!({"response":{"records":rows}})),
+                (200, json!({"response":{"record":{"recordid":"1"}}})),
+            ]);
+            let provider: GlesysProvider = toml::from_str(&format!(
+                r#"
+api_user="test"
+api_key="test"
+list_endpoint="{0}/list"
+add_endpoint="{0}/add"
+update_endpoint="{0}/update"
+[[records]]
+domain="example.com"
+hostname="@"
+type="static"
+record_type="AAAA"
+address="2001:db8::1"
+[[records]]
+domain="example.com"
+hostname="@"
+type="static"
+record_type="AAAA"
+address="2001:db8::2"
+"#,
+                api.url
+            ))
+            .unwrap();
+            let report = provider.update_selected(
+                &reqwest::blocking::Client::new(),
+                &ResolvedIps {
+                    ipv4: None,
+                    ipv6: None,
+                },
+                &[0],
+            );
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.applied, [0]);
+            let writes = usize::from(!first_present || ttl != 300);
+            assert_eq!(report.updates.len(), writes);
+            let requests = api.requests();
+            assert_eq!(requests.len(), 1 + writes);
+            if writes > 0 {
+                if first_present {
+                    assert_eq!(requests[1].0, "/update");
+                    assert_eq!(requests[1].1["recordid"], "1");
+                } else {
+                    assert_eq!(requests[1].0, "/add");
+                }
+                assert_eq!(requests[1].1["data"], "2001:db8::1");
+            }
+        }
+    }
+
+    #[test]
+    fn matching_records_are_applied_without_writes_but_ttl_changes_are_updated() {
+        for (ttl, writes) in [(300, 0), (60, 1)] {
+            let api = crate::test_support::MockApi::new(vec![
+                (
+                    200,
+                    json!({"response":{"records":[
+                        {"recordid":"1","domainname":"example.com","host":"@","type":"TXT","ttl":ttl,"data":"one"}
+                    ]}}),
+                ),
+                (200, json!({})),
+            ]);
+            let provider: GlesysProvider = toml::from_str(&format!(
+                "api_user=\"test\"\napi_key=\"test\"\nlist_endpoint=\"{0}/list\"\nupdate_endpoint=\"{0}/update\"",
+                api.url
+            ))
+            .unwrap();
+            let provider = GlesysProvider {
+                records: vec![txt()],
+                ..provider
+            };
+            let report = provider.update(
+                &reqwest::blocking::Client::new(),
+                &ResolvedIps {
+                    ipv4: None,
+                    ipv6: None,
+                },
+            );
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(report.applied, [0]);
+            assert_eq!(report.updates.len(), writes);
+            assert_eq!(api.requests().len(), 1 + writes);
+        }
     }
 
     #[test]

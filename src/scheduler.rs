@@ -70,11 +70,12 @@ impl Scheduler {
     }
 
     pub fn finish(&mut self, due: &[usize], applied: &[usize], ips: &ResolvedIps, now: Duration) {
+        for index in applied {
+            let entry = &mut self.entries[*index];
+            entry.last_applied = Some(entry.relevant(ips));
+        }
         for index in due {
             let entry = &mut self.entries[*index];
-            if applied.contains(index) {
-                entry.last_applied = Some(entry.relevant(ips));
-            }
             entry.next = if entry.once && entry.last_applied.is_some() {
                 None
             } else {
